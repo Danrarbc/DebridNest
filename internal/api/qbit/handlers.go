@@ -124,8 +124,8 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
 	username := r.FormValue("username")
 	password := r.FormValue("password")
 
-	if h.authenticateLogin(r.Context(), username, password) {
-		sid, err := h.sessions.create()
+	if user, ok := h.authenticateUser(r.Context(), username, password); ok {
+		sid, err := h.sessions.create(user)
 		if err != nil {
 			writeText(w, http.StatusInternalServerError, "Fails.")
 			return
@@ -153,16 +153,21 @@ func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) authenticateLogin(ctx context.Context, username, password string) bool {
+	_, ok := h.authenticateUser(ctx, username, password)
+	return ok
+}
+
+func (h *Handler) authenticateUser(ctx context.Context, username, password string) (auth.User, bool) {
 	qbitUser, qbitPass := h.cfg.QBitAuth()
 	if username == qbitUser && password == qbitPass {
-		return true
+		return legacyAdminUser(), true
 	}
 	if h.auth != nil {
-		if _, ok := h.auth.ValidateToken(ctx, "Bearer "+password); ok {
-			return true
+		if user, ok := h.auth.ValidateToken(ctx, "Bearer "+password); ok {
+			return user, true
 		}
 	}
-	return false
+	return auth.User{}, false
 }
 
 func (h *Handler) appVersion(w http.ResponseWriter, r *http.Request) {

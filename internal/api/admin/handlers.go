@@ -2,9 +2,12 @@ package admin
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -52,17 +55,34 @@ func (h *Handler) Routes() chi.Router {
 	r.Get("/config", h.publicConfig)
 	r.Get("/torrents", h.listTorrents)
 	r.Get("/torrents/{id}", h.getTorrent)
+	r.Get("/library", h.listLibrary)
+	r.Get("/library/{id}", h.getLibraryItem)
 	r.Post("/torrents/add", h.addMagnet)
 	r.Post("/torrents/upload", h.uploadTorrent)
 	r.Get("/settings", h.getSettings)
+	r.Get("/share-links", h.listShareLinks)
+	r.Post("/share-links", h.createShareLink)
+	r.Delete("/share-links/{id}", h.revokeShareLink)
 
 	r.Group(func(r chi.Router) {
 		r.Use(adminMiddleware)
 		r.Post("/torrents/batch-delete", h.batchDeleteTorrents)
 		r.Delete("/torrents/{id}", h.deleteTorrent)
+		r.Patch("/torrents/{id}/files/{fileID}/storage", h.patchTorrentFileStorage)
 		r.Post("/torrents/{id}/retry", h.retryTorrent)
+		r.Patch("/library/{id}", h.patchLibraryItem)
+		r.Delete("/library/{id}", h.deleteTorrent)
+		r.Post("/library/batch-delete", h.batchDeleteTorrents)
 		r.Post("/torrents/purge", h.purgeTorrents)
 		r.Post("/maintenance/cleanup", h.maintenanceCleanup)
+		r.Get("/storage/objects", h.listStorageObjects)
+		r.Get("/storage/reconcile", h.reconcileStorage)
+		r.Route("/imports/rss", func(r chi.Router) {
+			r.Get("/", h.listRSSImports)
+			r.Post("/", h.createRSSImport)
+			r.Post("/{id}/run", h.runRSSImport)
+			r.Delete("/{id}", h.deleteRSSImport)
+		})
 		r.Patch("/settings", h.patchSettings)
 		r.Post("/settings/s3-test", h.testS3Settings)
 		r.Get("/activity", h.listActivity)
@@ -70,6 +90,7 @@ func (h *Handler) Routes() chi.Router {
 		r.Route("/users", func(r chi.Router) {
 			r.Get("/", h.listUsers)
 			r.Post("/", h.createUser)
+			r.Patch("/{id}", h.patchUser)
 			r.Delete("/{id}", h.deleteUser)
 			r.Post("/{id}/rotate-token", h.rotateUserToken)
 		})
@@ -147,17 +168,22 @@ func (h *Handler) listTorrents(w http.ResponseWriter, r *http.Request) {
 			size = rec.Bytes
 		}
 		entry := map[string]any{
-			"id":        rec.ID,
-			"name":      rec.Name,
-			"hash":      rec.InfoHash,
-			"status":    rec.Status,
-			"lifecycle": torrentmgr.LifecycleViewForRecord(rec, h.cfg.MinStreamBytes()),
-			"progress":  rec.Progress,
-			"bytes":     rec.Bytes,
-			"size":      size,
-			"speed":     rec.Speed,
-			"seeders":   rec.Seeders,
-			"added":     rec.AddedAt,
+			"id":              rec.ID,
+			"name":            rec.Name,
+			"hash":            rec.InfoHash,
+			"status":          rec.Status,
+			"lifecycle":       torrentmgr.LifecycleViewForRecord(rec, h.cfg.MinStreamBytes()),
+			"progress":        rec.Progress,
+			"bytes":           rec.Bytes,
+			"size":            size,
+			"speed":           rec.Speed,
+			"seeders":         rec.Seeders,
+			"added":           rec.AddedAt,
+			"ownerId":         rec.OwnerID,
+			"ownerName":       rec.OwnerName,
+			"pinned":          rec.LibraryPinned,
+			"favorite":        rec.LibraryFavorite,
+			"retentionExempt": rec.RetentionExempt,
 		}
 		if rec.EndedAt != nil {
 			entry["ended"] = rec.EndedAt
@@ -182,32 +208,141 @@ func (h *Handler) getTorrent(w http.ResponseWriter, r *http.Request) {
 
 	files := make([]map[string]any, 0, len(rec.Files))
 	for _, f := range rec.Files {
-		files = append(files, map[string]any{
-			"id":              f.ID,
-			"path":            f.Path,
-			"bytes":           f.Bytes,
-			"selected":        f.Selected,
-			"downloadedBytes": f.DownloadedBytes,
-			"streamableBytes": f.StreamableBytes,
-		})
+		files = append(files, torrentFilePayload(f, torrentmgr.NewLifecycle(h.cfg.MinStreamBytes()).FileLinksVisible(rec, f)))
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"id":        rec.ID,
-		"name":      rec.Name,
-		"hash":      rec.InfoHash,
-		"status":    rec.Status,
-		"lifecycle": torrentmgr.LifecycleViewForRecord(rec, h.cfg.MinStreamBytes()),
-		"progress":  rec.Progress,
-		"bytes":     rec.Bytes,
-		"size":      size,
-		"speed":     rec.Speed,
-		"seeders":   rec.Seeders,
-		"added":     rec.AddedAt,
-		"ended":     rec.EndedAt,
-		"files":     files,
-		"links":     rec.Links,
+		"id":              rec.ID,
+		"name":            rec.Name,
+		"hash":            rec.InfoHash,
+		"status":          rec.Status,
+		"lifecycle":       torrentmgr.LifecycleViewForRecord(rec, h.cfg.MinStreamBytes()),
+		"progress":        rec.Progress,
+		"bytes":           rec.Bytes,
+		"size":            size,
+		"speed":           rec.Speed,
+		"seeders":         rec.Seeders,
+		"added":           rec.AddedAt,
+		"ended":           rec.EndedAt,
+		"files":           files,
+		"links":           visibleHostLinks(h.cfg, rec),
+		"ownerId":         rec.OwnerID,
+		"ownerName":       rec.OwnerName,
+		"pinned":          rec.LibraryPinned,
+		"favorite":        rec.LibraryFavorite,
+		"retentionExempt": rec.RetentionExempt,
 	})
+}
+
+func (h *Handler) listLibrary(w http.ResponseWriter, r *http.Request) {
+	limit := queryInt(r, "limit", 500)
+	if limit > 2000 {
+		limit = 2000
+	}
+
+	items, err := h.manager.ListLibrary(r.Context(), limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	query := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
+	filter := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("filter")))
+	if filter == "" {
+		filter = "all"
+	}
+	if !validLibraryFilter(filter) {
+		writeError(w, http.StatusBadRequest, "unknown library filter")
+		return
+	}
+
+	filtered := make([]storage.TorrentRecord, 0, len(items))
+	for i := range items {
+		rec := &items[i]
+		if !libraryFilterMatches(rec, filter) {
+			continue
+		}
+		if query != "" && !librarySearchMatches(rec, query) {
+			continue
+		}
+		filtered = append(filtered, *rec)
+	}
+	sortLibraryItems(filtered, r.URL.Query().Get("sort"), r.URL.Query().Get("dir"))
+
+	out := make([]map[string]any, 0, len(filtered))
+	for i := range filtered {
+		out = append(out, libraryItemResponse(h.cfg, &filtered[i], false))
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (h *Handler) getLibraryItem(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	rec, err := h.manager.Get(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if !torrentmgr.LifecycleViewForRecord(rec, h.cfg.MinStreamBytes()).Completed {
+		writeError(w, http.StatusNotFound, "library item not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, libraryItemResponse(h.cfg, rec, true))
+}
+
+func (h *Handler) patchLibraryItem(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var body struct {
+		Pinned          *bool `json:"pinned"`
+		Favorite        *bool `json:"favorite"`
+		RetentionExempt *bool `json:"retentionExempt"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if body.Pinned == nil && body.Favorite == nil && body.RetentionExempt == nil {
+		writeError(w, http.StatusBadRequest, "library state required")
+		return
+	}
+
+	rec, err := h.manager.Get(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if !torrentmgr.LifecycleViewForRecord(rec, h.cfg.MinStreamBytes()).Completed {
+		writeError(w, http.StatusBadRequest, "library item is not completed")
+		return
+	}
+
+	state := storage.TorrentLibraryState{
+		Pinned:          rec.LibraryPinned,
+		Favorite:        rec.LibraryFavorite,
+		RetentionExempt: rec.RetentionExempt,
+	}
+	if body.Pinned != nil {
+		state.Pinned = *body.Pinned
+	}
+	if body.Favorite != nil {
+		state.Favorite = *body.Favorite
+	}
+	if body.RetentionExempt != nil {
+		state.RetentionExempt = *body.RetentionExempt
+	}
+
+	updated, err := h.manager.SetLibraryState(r.Context(), id, state)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	h.LogActivity(r.Context(), ActionLibraryPatch, map[string]any{
+		"torrentId":       id,
+		"pinned":          state.Pinned,
+		"favorite":        state.Favorite,
+		"retentionExempt": state.RetentionExempt,
+	})
+	writeJSON(w, http.StatusOK, libraryItemResponse(h.cfg, updated, true))
 }
 
 func (h *Handler) addMagnet(w http.ResponseWriter, r *http.Request) {
@@ -225,7 +360,7 @@ func (h *Handler) addMagnet(w http.ResponseWriter, r *http.Request) {
 
 	rec, err := h.manager.AddMagnet(r.Context(), body.Magnet)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeTorrentManagerError(w, err)
 		return
 	}
 	h.LogActivity(r.Context(), ActionAddMagnet, map[string]any{
@@ -260,7 +395,7 @@ func (h *Handler) uploadTorrent(w http.ResponseWriter, r *http.Request) {
 
 	rec, err := h.manager.AddTorrentFile(r.Context(), data)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeTorrentManagerError(w, err)
 		return
 	}
 	h.LogActivity(r.Context(), ActionUploadTorrent, map[string]any{
@@ -388,6 +523,221 @@ func (h *Handler) publicConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+func queryInt(r *http.Request, key string, fallback int) int {
+	if v := r.URL.Query().Get(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return fallback
+}
+
+func validLibraryFilter(filter string) bool {
+	switch filter {
+	case "all", "favorite", "favorites", "pinned", "protected", "retention", "excluded", "unprotected":
+		return true
+	default:
+		return false
+	}
+}
+
+func libraryFilterMatches(rec *storage.TorrentRecord, filter string) bool {
+	if rec == nil {
+		return false
+	}
+	switch filter {
+	case "all":
+		return true
+	case "favorite", "favorites":
+		return rec.LibraryFavorite
+	case "pinned":
+		return rec.LibraryPinned
+	case "protected", "retention", "excluded":
+		return rec.RetentionExempt
+	case "unprotected":
+		return !rec.RetentionExempt
+	default:
+		return false
+	}
+}
+
+func librarySearchMatches(rec *storage.TorrentRecord, query string) bool {
+	if rec == nil {
+		return false
+	}
+	if strings.Contains(strings.ToLower(rec.Name), query) ||
+		strings.Contains(strings.ToLower(rec.OriginalName), query) ||
+		strings.Contains(strings.ToLower(rec.InfoHash), query) {
+		return true
+	}
+	for _, f := range rec.Files {
+		if strings.Contains(strings.ToLower(f.Path), query) {
+			return true
+		}
+	}
+	return false
+}
+
+func sortLibraryItems(items []storage.TorrentRecord, sortKey, dir string) {
+	sortKey = strings.ToLower(strings.TrimSpace(sortKey))
+	if sortKey == "" {
+		sortKey = "recent"
+	}
+
+	descending := sortKey != "name"
+	switch strings.ToLower(strings.TrimSpace(dir)) {
+	case "asc":
+		descending = false
+	case "desc":
+		descending = true
+	}
+
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].LibraryPinned != items[j].LibraryPinned {
+			return items[i].LibraryPinned
+		}
+		if items[i].LibraryFavorite != items[j].LibraryFavorite {
+			return items[i].LibraryFavorite
+		}
+
+		cmp := compareLibraryItems(items[i], items[j], sortKey)
+		if cmp == 0 {
+			return items[i].ID < items[j].ID
+		}
+		if descending {
+			return cmp > 0
+		}
+		return cmp < 0
+	})
+}
+
+func compareLibraryItems(a, b storage.TorrentRecord, sortKey string) int {
+	switch sortKey {
+	case "name":
+		return strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name))
+	case "size":
+		return compareInt64(libraryItemSize(&a), libraryItemSize(&b))
+	case "added":
+		return compareTime(a.AddedAt, b.AddedAt)
+	default:
+		return compareTime(libraryItemTime(&a), libraryItemTime(&b))
+	}
+}
+
+func compareInt64(a, b int64) int {
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func compareTime(a, b time.Time) int {
+	switch {
+	case a.Before(b):
+		return -1
+	case a.After(b):
+		return 1
+	default:
+		return 0
+	}
+}
+
+func libraryItemTime(rec *storage.TorrentRecord) time.Time {
+	if rec == nil {
+		return time.Time{}
+	}
+	if rec.EndedAt != nil {
+		return *rec.EndedAt
+	}
+	return rec.AddedAt
+}
+
+func libraryItemSize(rec *storage.TorrentRecord) int64 {
+	if rec == nil {
+		return 0
+	}
+	if rec.OriginalBytes > 0 {
+		return rec.OriginalBytes
+	}
+	return rec.Bytes
+}
+
+func libraryItemResponse(cfg config.Config, rec *storage.TorrentRecord, includeFiles bool) map[string]any {
+	size := libraryItemSize(rec)
+	selectedCount := 0
+	var selectedBytes int64
+	for _, f := range rec.Files {
+		if f.Selected {
+			selectedCount++
+			selectedBytes += f.Bytes
+		}
+	}
+
+	entry := map[string]any{
+		"id":                rec.ID,
+		"name":              rec.Name,
+		"hash":              rec.InfoHash,
+		"status":            rec.Status,
+		"lifecycle":         torrentmgr.LifecycleViewForRecord(rec, cfg.MinStreamBytes()),
+		"progress":          rec.Progress,
+		"bytes":             rec.Bytes,
+		"size":              size,
+		"speed":             rec.Speed,
+		"seeders":           rec.Seeders,
+		"added":             rec.AddedAt,
+		"ended":             rec.EndedAt,
+		"links":             visibleHostLinks(cfg, rec),
+		"ownerId":           rec.OwnerID,
+		"ownerName":         rec.OwnerName,
+		"pinned":            rec.LibraryPinned,
+		"favorite":          rec.LibraryFavorite,
+		"retentionExempt":   rec.RetentionExempt,
+		"fileCount":         len(rec.Files),
+		"selectedFileCount": selectedCount,
+		"selectedBytes":     selectedBytes,
+	}
+	if includeFiles {
+		files := make([]map[string]any, 0, len(rec.Files))
+		for _, f := range rec.Files {
+			files = append(files, torrentFilePayload(f, torrentmgr.NewLifecycle(cfg.MinStreamBytes()).FileLinksVisible(rec, f)))
+		}
+		entry["files"] = files
+	}
+	return entry
+}
+
+func visibleHostLinks(cfg config.Config, rec *storage.TorrentRecord) []string {
+	if rec == nil || len(rec.Links) == 0 {
+		return []string{}
+	}
+	lifecycle := torrentmgr.NewLifecycle(cfg.MinStreamBytes())
+	out := make([]string, 0, len(rec.Links))
+	linkIndex := 0
+	for _, f := range rec.Files {
+		if !f.Selected {
+			continue
+		}
+		if linkIndex >= len(rec.Links) {
+			break
+		}
+		link := rec.Links[linkIndex]
+		linkIndex++
+		if link == "" || !lifecycle.FileLinksVisible(rec, f) {
+			continue
+		}
+		if strings.HasPrefix(link, "http") {
+			out = append(out, link)
+		} else {
+			out = append(out, strings.TrimRight(cfg.PublicURL, "/")+"/d/"+link)
+		}
+	}
+	return out
+}
+
 func (h *Handler) configExtras() map[string]any {
 	return map[string]any{
 		"seedAfterComplete": h.cfg.SeedAfterComplete,
@@ -410,14 +760,19 @@ func torrentSummary(cfg config.Config, rec *storage.TorrentRecord) map[string]an
 		size = rec.Bytes
 	}
 	return map[string]any{
-		"id":        rec.ID,
-		"name":      rec.Name,
-		"hash":      rec.InfoHash,
-		"status":    rec.Status,
-		"lifecycle": torrentmgr.LifecycleViewForRecord(rec, cfg.MinStreamBytes()),
-		"progress":  rec.Progress,
-		"bytes":     rec.Bytes,
-		"size":      size,
+		"id":              rec.ID,
+		"name":            rec.Name,
+		"hash":            rec.InfoHash,
+		"status":          rec.Status,
+		"lifecycle":       torrentmgr.LifecycleViewForRecord(rec, cfg.MinStreamBytes()),
+		"progress":        rec.Progress,
+		"bytes":           rec.Bytes,
+		"size":            size,
+		"ownerId":         rec.OwnerID,
+		"ownerName":       rec.OwnerName,
+		"pinned":          rec.LibraryPinned,
+		"favorite":        rec.LibraryFavorite,
+		"retentionExempt": rec.RetentionExempt,
 	}
 }
 
@@ -429,4 +784,17 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]any{"error": msg})
+}
+
+func writeTorrentManagerError(w http.ResponseWriter, err error) {
+	status := http.StatusBadRequest
+	switch {
+	case errors.Is(err, torrentmgr.ErrAccessDenied):
+		status = http.StatusForbidden
+	case errors.Is(err, torrentmgr.ErrUserQuotaExceeded):
+		status = http.StatusForbidden
+	case errors.Is(err, torrentmgr.ErrObjectStorageQuotaExceeded):
+		status = http.StatusInsufficientStorage
+	}
+	writeError(w, status, err.Error())
 }

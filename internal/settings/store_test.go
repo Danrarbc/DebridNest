@@ -40,6 +40,7 @@ func TestStorePatchAndMerge(t *testing.T) {
 		"diskQuotaGb":              float64(250),
 		"downloadRateLimitMbps":    12.5,
 		"notifyOnDownloadComplete": true,
+		"notifyOnTorrentProblem":   true,
 	})
 	if err != nil {
 		t.Fatalf("patch: %v", err)
@@ -55,6 +56,9 @@ func TestStorePatchAndMerge(t *testing.T) {
 	}
 	if !updated.NotifyOnDownloadComplete {
 		t.Fatal("expected notifyOnDownloadComplete true")
+	}
+	if !updated.NotifyOnTorrentProblem {
+		t.Fatal("expected notifyOnTorrentProblem true")
 	}
 	if store.GetRetentionDays() != 7 {
 		t.Fatalf("getter retentionDays = %d, want 7", store.GetRetentionDays())

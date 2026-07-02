@@ -192,3 +192,108 @@ func TestDeleteManyRemovesFiles(t *testing.T) {
 		}
 	}
 }
+
+func TestRetentionExemptTorrentsAreSkippedByAutomaticCleanup(t *testing.T) {
+	manager, db := testManager(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	old := now.Add(-48 * time.Hour)
+
+	for _, rec := range []storage.TorrentRecord{
+		{
+			ID:              "RETKEEP1",
+			InfoHash:        "3333333333333333333333333333333333333333",
+			Magnet:          testMagnet("3333333333333333333333333333333333333333"),
+			Name:            "keep",
+			Status:          "downloaded",
+			Bytes:           1000,
+			AddedAt:         old,
+			EndedAt:         &old,
+			RetentionExempt: true,
+		},
+		{
+			ID:       "RETDEL01",
+			InfoHash: "4444444444444444444444444444444444444444",
+			Magnet:   testMagnet("4444444444444444444444444444444444444444"),
+			Name:     "delete",
+			Status:   "downloaded",
+			Bytes:    1000,
+			AddedAt:  old,
+			EndedAt:  &old,
+		},
+	} {
+		if err := db.CreateTorrent(ctx, rec); err != nil {
+			t.Fatalf("create %s: %v", rec.ID, err)
+		}
+		if err := db.UpdateTorrent(ctx, rec); err != nil {
+			t.Fatalf("mark %s completed: %v", rec.ID, err)
+		}
+	}
+
+	removed, err := manager.DeleteCompletedBefore(ctx, now.Add(-24*time.Hour))
+	if err != nil {
+		t.Fatalf("delete completed before: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1", removed)
+	}
+	if _, err := db.GetTorrent(ctx, "RETKEEP1"); err != nil {
+		t.Fatalf("retention-exempt torrent was removed: %v", err)
+	}
+	if _, err := db.GetTorrent(ctx, "RETDEL01"); err == nil {
+		t.Fatal("non-exempt torrent still exists")
+	}
+}
+
+func TestRetentionExemptTorrentsAreSkippedByQuotaEviction(t *testing.T) {
+	manager, db := testManager(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	oldest := now.Add(-48 * time.Hour)
+	newer := now.Add(-24 * time.Hour)
+
+	for _, rec := range []storage.TorrentRecord{
+		{
+			ID:              "QUOTKEEP",
+			InfoHash:        "5555555555555555555555555555555555555555",
+			Magnet:          testMagnet("5555555555555555555555555555555555555555"),
+			Name:            "keep",
+			Status:          "downloaded",
+			Bytes:           1000,
+			AddedAt:         oldest,
+			EndedAt:         &oldest,
+			RetentionExempt: true,
+		},
+		{
+			ID:       "QUOTDEL1",
+			InfoHash: "6666666666666666666666666666666666666666",
+			Magnet:   testMagnet("6666666666666666666666666666666666666666"),
+			Name:     "delete",
+			Status:   "downloaded",
+			Bytes:    1000,
+			AddedAt:  newer,
+			EndedAt:  &newer,
+		},
+	} {
+		if err := db.CreateTorrent(ctx, rec); err != nil {
+			t.Fatalf("create %s: %v", rec.ID, err)
+		}
+		if err := db.UpdateTorrent(ctx, rec); err != nil {
+			t.Fatalf("mark %s completed: %v", rec.ID, err)
+		}
+	}
+
+	removed, err := manager.EvictOldestCompleted(ctx, 500)
+	if err != nil {
+		t.Fatalf("quota eviction: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1", removed)
+	}
+	if _, err := db.GetTorrent(ctx, "QUOTKEEP"); err != nil {
+		t.Fatalf("retention-exempt torrent was evicted: %v", err)
+	}
+	if _, err := db.GetTorrent(ctx, "QUOTDEL1"); err == nil {
+		t.Fatal("non-exempt torrent still exists")
+	}
+}

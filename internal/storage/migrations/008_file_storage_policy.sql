@@ -1,0 +1,1 @@
+ALTER TABLE torrent_files ADD COLUMN keep_local INTEGER NOT NULL DEFAULT 0;

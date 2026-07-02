@@ -78,7 +78,10 @@ func (m *Manager) OpenServingReader(ctx context.Context, torrentID string, fileI
 	if file == nil || !file.Selected {
 		return nil, time.Time{}, 0, fmt.Errorf("file not found")
 	}
-	if rec.Status != string(StatusDownloaded) && !m.lifecycle.FileLinksVisible(rec, *file) {
+	if !m.lifecycle.FileLinksVisible(rec, *file) {
+		if rec.Status == string(StatusDownloaded) {
+			return nil, time.Time{}, 0, os.ErrNotExist
+		}
 		return nil, time.Time{}, 0, ErrStreamNotReady
 	}
 

@@ -38,6 +38,7 @@ var configEnvKeys = []string{
 	"DEBRIDNEST_WEBHOOK_GOTIFY_URL",
 	"DEBRIDNEST_WEBHOOK_GOTIFY_TOKEN",
 	"DEBRIDNEST_NOTIFY_ON_DOWNLOAD_COMPLETE",
+	"DEBRIDNEST_NOTIFY_ON_TORRENT_PROBLEM",
 	"DEBRIDNEST_NOTIFY_ON_QUOTA_WARNING",
 }
 
@@ -94,6 +95,31 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if cfg.QBitPassword != cfg.APIToken {
 		t.Fatalf("QBitPassword default = %q, want API token", cfg.QBitPassword)
+	}
+	if !cfg.NotifyOnDownloadComplete || !cfg.NotifyOnTorrentProblem || !cfg.NotifyOnQuotaWarning {
+		t.Fatalf("notification defaults = complete:%v problem:%v quota:%v, want all true", cfg.NotifyOnDownloadComplete, cfg.NotifyOnTorrentProblem, cfg.NotifyOnQuotaWarning)
+	}
+}
+
+func TestLoadNotificationToggles(t *testing.T) {
+	cleanConfigEnv(t)
+	setValidToken(t)
+	t.Setenv("DEBRIDNEST_NOTIFY_ON_DOWNLOAD_COMPLETE", "false")
+	t.Setenv("DEBRIDNEST_NOTIFY_ON_TORRENT_PROBLEM", "0")
+	t.Setenv("DEBRIDNEST_NOTIFY_ON_QUOTA_WARNING", "true")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.NotifyOnDownloadComplete {
+		t.Fatal("NotifyOnDownloadComplete = true, want false")
+	}
+	if cfg.NotifyOnTorrentProblem {
+		t.Fatal("NotifyOnTorrentProblem = true, want false")
+	}
+	if !cfg.NotifyOnQuotaWarning {
+		t.Fatal("NotifyOnQuotaWarning = false, want true")
 	}
 }
 

@@ -112,11 +112,13 @@ Configure via the dashboard **Settings** tab or `PATCH /api/v1/settings` (admin)
 | `webhookGotifyUrl` | `DEBRIDNEST_WEBHOOK_GOTIFY_URL` | Gotify server base URL |
 | `webhookGotifyToken` | `DEBRIDNEST_WEBHOOK_GOTIFY_TOKEN` | Gotify app token |
 | `notifyOnDownloadComplete` | `DEBRIDNEST_NOTIFY_ON_DOWNLOAD_COMPLETE` | Notify when a torrent finishes downloading (default `true`) |
+| `notifyOnTorrentProblem` | `DEBRIDNEST_NOTIFY_ON_TORRENT_PROBLEM` | Notify when a torrent fails or gets stuck resolving metadata (default `true`) |
 | `notifyOnQuotaWarning` | `DEBRIDNEST_NOTIFY_ON_QUOTA_WARNING` | Notify when disk quota threshold is reached (default `true`) |
 
 When enabled, DebridNest posts to all configured webhook targets. Events:
 
 - **Download complete** — torrent reaches `downloaded` status
+- **Torrent failed or stuck** — torrent enters `error`, `magnet_error`, or `dead`
 - **Quota warning** — disk usage exceeds configured quota during retention checks
 
 ## Object storage (S3)

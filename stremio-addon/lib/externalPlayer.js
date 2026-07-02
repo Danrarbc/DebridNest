@@ -18,8 +18,24 @@ function buildIinaUrl(targetUrl) {
   return `iina://open?url=${encodeURIComponent(targetUrl)}`
 }
 
-function buildPlayUrl(streamId, addonBaseUrl) {
-  return `${addonBaseUrl.replace(/\/+$/, '')}/play/${streamId}`
+function streamPathName(label) {
+  const raw = String(label || 'stream').trim()
+  const extMatch = raw.match(/\.([a-z0-9]{2,5})$/i)
+  const ext = extMatch ? extMatch[1].toLowerCase() : 'mkv'
+  const base = raw
+    .replace(/\.[a-z0-9]{2,5}$/i, '')
+    .replace(/[^a-z0-9]+/gi, '.')
+    .replace(/^\.+|\.+$/g, '')
+    .slice(0, 96) || 'stream'
+  return `${base}.${ext}`
+}
+
+function isPlayProxyUrl(url) {
+  return /\/play\/[a-f0-9]{16,}(?:\/|$|\?)/i.test(String(url || ''))
+}
+
+function buildPlayUrl(streamId, addonBaseUrl, label = '') {
+  return `${addonBaseUrl.replace(/\/+$/, '')}/play/${streamId}/${encodeURIComponent(streamPathName(label))}`
 }
 
 function registerStream(meta = {}) {
@@ -151,6 +167,8 @@ function escapeHtml(value) {
 module.exports = {
   buildIinaUrl,
   buildPlayUrl,
+  isPlayProxyUrl,
+  streamPathName,
   registerStream,
   getStream,
   buildOpenPageHtml,

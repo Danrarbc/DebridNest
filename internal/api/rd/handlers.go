@@ -1,6 +1,7 @@
 package rd
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -92,6 +93,10 @@ func (h *Handler) addMagnet(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		if errors.Is(err, torrentmgr.ErrAccessDenied) || errors.Is(err, torrentmgr.ErrUserQuotaExceeded) {
+			writeError(w, http.StatusForbidden, err.Error())
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -122,6 +127,10 @@ func (h *Handler) addTorrent(w http.ResponseWriter, r *http.Request) {
 
 	rec, err := h.manager.AddTorrentFile(r.Context(), data)
 	if err != nil {
+		if errors.Is(err, torrentmgr.ErrAccessDenied) || errors.Is(err, torrentmgr.ErrUserQuotaExceeded) {
+			writeError(w, http.StatusForbidden, err.Error())
+			return
+		}
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -254,6 +263,10 @@ func (h *Handler) selectFiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.manager.SelectFiles(r.Context(), id, files); err != nil {
+		if errors.Is(err, torrentmgr.ErrAccessDenied) || errors.Is(err, torrentmgr.ErrUserQuotaExceeded) {
+			writeError(w, http.StatusForbidden, err.Error())
+			return
+		}
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -263,6 +276,10 @@ func (h *Handler) selectFiles(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) deleteTorrent(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	if err := h.manager.Delete(r.Context(), id); err != nil {
+		if errors.Is(err, torrentmgr.ErrAccessDenied) {
+			writeError(w, http.StatusForbidden, err.Error())
+			return
+		}
 		writeError(w, http.StatusNotFound, "unknown resource")
 		return
 	}
@@ -385,6 +402,10 @@ func (h *Handler) serveSigned(w http.ResponseWriter, r *http.Request, rawPath st
 		writeError(w, http.StatusNotFound, "file not found")
 		return
 	}
+	if !torrentmgr.NewLifecycle(h.cfg.MinStreamBytes()).FileLinksVisible(rec, *file) {
+		writeError(w, http.StatusNotFound, "file not found")
+		return
+	}
 
 	filename := filepath.Base(relativePath)
 	byteRange := torrentmgr.ParseRange(r.Header.Get("Range"), file.Bytes)
@@ -421,18 +442,35 @@ func (h *Handler) serveSigned(w http.ResponseWriter, r *http.Request, rawPath st
 	}
 
 	limited := reader
-	if limiter := h.downloadRateLimiter(); limiter != nil {
+	if limiter := h.downloadRateLimiterForOwner(ctx, rec.OwnerID); limiter != nil {
 		limited = limiter.ReadSeekCloser(reader)
 	}
 	http.ServeContent(out, r, filename, modTime, limited)
 }
 
 func (h *Handler) downloadRateLimiter() *links.RateLimiter {
+	return links.NewRateLimiter(h.globalDownloadRateLimitMbps())
+}
+
+func (h *Handler) downloadRateLimiterForOwner(ctx context.Context, ownerID string) *links.RateLimiter {
+	limit := h.globalDownloadRateLimitMbps()
+	if h.auth != nil && ownerID != "" {
+		if user, err := h.auth.GetUser(ctx, ownerID); err == nil && user.RateLimitMbps > 0 {
+			if limit > 0 && limit < user.RateLimitMbps {
+				return links.NewRateLimiter(limit)
+			}
+			return links.NewRateLimiter(user.RateLimitMbps)
+		}
+	}
+	return links.NewRateLimiter(limit)
+}
+
+func (h *Handler) globalDownloadRateLimitMbps() float64 {
 	limit := h.cfg.DownloadRateLimitMB
 	if h.manager != nil {
 		limit = h.manager.GetDownloadRateLimitMbps()
 	}
-	return links.NewRateLimiter(limit)
+	return limit
 }
 
 func torrentInfoResponse(cfg config.Config, rec *storage.TorrentRecord) map[string]any {

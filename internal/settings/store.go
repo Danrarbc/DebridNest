@@ -23,6 +23,7 @@ const (
 	keyWebhookGotifyURL         = "webhookGotifyUrl"
 	keyWebhookGotifyToken       = "webhookGotifyToken"
 	keyNotifyOnDownloadComplete = "notifyOnDownloadComplete"
+	keyNotifyOnTorrentProblem   = "notifyOnTorrentProblem"
 	keyNotifyOnQuotaWarning     = "notifyOnQuotaWarning"
 	keyS3Enabled                = "s3Enabled"
 	keyS3Endpoint               = "s3Endpoint"
@@ -45,6 +46,7 @@ var patchableKeys = map[string]bool{
 	keyWebhookGotifyURL:         true,
 	keyWebhookGotifyToken:       true,
 	keyNotifyOnDownloadComplete: true,
+	keyNotifyOnTorrentProblem:   true,
 	keyNotifyOnQuotaWarning:     true,
 	keyS3Enabled:                true,
 	keyS3Endpoint:               true,
@@ -67,6 +69,7 @@ type Merged struct {
 	WebhookGotifyUrl         string  `json:"webhookGotifyUrl"`
 	WebhookGotifyToken       string  `json:"webhookGotifyToken"`
 	NotifyOnDownloadComplete bool    `json:"notifyOnDownloadComplete"`
+	NotifyOnTorrentProblem   bool    `json:"notifyOnTorrentProblem"`
 	NotifyOnQuotaWarning     bool    `json:"notifyOnQuotaWarning"`
 	S3Enabled                bool    `json:"s3Enabled"`
 	S3Endpoint               string  `json:"s3Endpoint"`
@@ -134,6 +137,7 @@ func (s *Store) GetMerged() Merged {
 		WebhookGotifyUrl:         s.GetWebhookGotifyURL(),
 		WebhookGotifyToken:       s.GetWebhookGotifyToken(),
 		NotifyOnDownloadComplete: s.GetNotifyOnDownloadComplete(),
+		NotifyOnTorrentProblem:   s.GetNotifyOnTorrentProblem(),
 		NotifyOnQuotaWarning:     s.GetNotifyOnQuotaWarning(),
 		S3Enabled:                s.GetS3Enabled(),
 		S3Endpoint:               s.GetS3Endpoint(),
@@ -332,6 +336,13 @@ func (s *Store) GetNotifyOnDownloadComplete() bool {
 		return v
 	}
 	return s.cfg.NotifyOnDownloadComplete
+}
+
+func (s *Store) GetNotifyOnTorrentProblem() bool {
+	if v, ok := s.overrideBool(keyNotifyOnTorrentProblem); ok {
+		return v
+	}
+	return s.cfg.NotifyOnTorrentProblem
 }
 
 func (s *Store) GetNotifyOnQuotaWarning() bool {

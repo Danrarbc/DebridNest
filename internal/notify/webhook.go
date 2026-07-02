@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -32,7 +33,20 @@ func (s *Service) NotifyDownloadComplete(torrentName string) {
 		return
 	}
 	title := "Download complete"
-	body := fmt.Sprintf("Torrent finished: %s", torrentName)
+	body := fmt.Sprintf("Torrent finished: %s", displayName(torrentName))
+	s.sendAsync(title, body)
+}
+
+func (s *Service) NotifyTorrentProblem(torrentName, status string) {
+	cfg := s.settings.NotifySettings()
+	if !cfg.NotifyOnTorrentProblem {
+		return
+	}
+	title := "Torrent failed or stuck"
+	body := fmt.Sprintf("%s: %s", problemDescription(status), displayName(torrentName))
+	if status = strings.TrimSpace(status); status != "" {
+		body = fmt.Sprintf("%s (%s)", body, status)
+	}
 	s.sendAsync(title, body)
 }
 
@@ -54,6 +68,25 @@ func (s *Service) NotifyQuotaWarning(used, quota int64) {
 	title := "Disk quota warning"
 	body := fmt.Sprintf("Disk usage at %d%% (%d / %d bytes)", pct, used, quota)
 	s.sendAsync(title, body)
+}
+
+func displayName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "unknown torrent"
+	}
+	return name
+}
+
+func problemDescription(status string) string {
+	switch strings.TrimSpace(status) {
+	case "magnet_error":
+		return "Torrent metadata failed or timed out"
+	case "dead":
+		return "Torrent appears dead"
+	default:
+		return "Torrent download failed"
+	}
 }
 
 func (s *Service) sendAsync(title, body string) {
@@ -91,8 +124,8 @@ func (s *Service) sendNtfy(topic, title, body string) {
 
 func (s *Service) sendGotify(baseURL, token, title, body string) {
 	payload, err := json.Marshal(map[string]any{
-		"title":   title,
-		"message": body,
+		"title":    title,
+		"message":  body,
 		"priority": 5,
 	})
 	if err != nil {

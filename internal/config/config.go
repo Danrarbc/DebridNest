@@ -67,6 +67,7 @@ type Config struct {
 	WebhookGotifyURL         string
 	WebhookGotifyToken       string
 	NotifyOnDownloadComplete bool
+	NotifyOnTorrentProblem   bool
 	NotifyOnQuotaWarning     bool
 }
 
@@ -170,8 +171,9 @@ func Load() (Config, error) {
 	}
 	transcodeEnabled := os.Getenv("DEBRIDNEST_TRANSCODE") == "1"
 	multiUserEnabled := os.Getenv("DEBRIDNEST_MULTI_USER") != "0"
-	notifyOnDownloadComplete := os.Getenv("DEBRIDNEST_NOTIFY_ON_DOWNLOAD_COMPLETE") == "1"
-	notifyOnQuotaWarning := os.Getenv("DEBRIDNEST_NOTIFY_ON_QUOTA_WARNING") == "1"
+	notifyOnDownloadComplete := envBool("DEBRIDNEST_NOTIFY_ON_DOWNLOAD_COMPLETE", true)
+	notifyOnTorrentProblem := envBool("DEBRIDNEST_NOTIFY_ON_TORRENT_PROBLEM", true)
+	notifyOnQuotaWarning := envBool("DEBRIDNEST_NOTIFY_ON_QUOTA_WARNING", true)
 
 	return Config{
 		APIToken:                 token,
@@ -208,6 +210,7 @@ func Load() (Config, error) {
 		WebhookGotifyURL:         os.Getenv("DEBRIDNEST_WEBHOOK_GOTIFY_URL"),
 		WebhookGotifyToken:       os.Getenv("DEBRIDNEST_WEBHOOK_GOTIFY_TOKEN"),
 		NotifyOnDownloadComplete: notifyOnDownloadComplete,
+		NotifyOnTorrentProblem:   notifyOnTorrentProblem,
 		NotifyOnQuotaWarning:     notifyOnQuotaWarning,
 	}, nil
 }
@@ -297,6 +300,18 @@ func getenv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func envBool(key string, fallback bool) bool {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		return fallback
+	}
+	return v
 }
 
 func trimTrailingSlash(s string) string {

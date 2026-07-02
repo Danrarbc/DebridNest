@@ -1,4 +1,31 @@
-{$DOMAIN} {
+(owner_only) {
+	@blocked {
+		not remote_ip {$OWNER_IP:0.0.0.0/0}
+		not path /.well-known/acme-challenge/*
+	}
+	respond @blocked "Forbidden" 403
+}
+
+(cors_media) {
+	header {
+		Access-Control-Allow-Origin "*"
+		Access-Control-Allow-Methods "GET, HEAD, OPTIONS"
+		Access-Control-Allow-Headers "Authorization, Content-Type, Range"
+		Access-Control-Expose-Headers "Accept-Ranges, Content-Length, Content-Range, Content-Type, Location"
+	}
+	@options method OPTIONS
+	respond @options 204
+}
+
+{$DEBRIDNEST_DOMAIN:localhost} {
+	import owner_only
+	import cors_media
 	encode gzip
 	reverse_proxy debridnest:8080
+}
+
+{$STREMIO_ADDON_DOMAIN:stremio.localhost} {
+	import owner_only
+	encode gzip
+	reverse_proxy stremio-addon:7001
 }

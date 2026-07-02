@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/debridnest/debridnest/internal/auth"
 	"github.com/debridnest/debridnest/internal/storage"
@@ -105,6 +106,68 @@ func TestCreateDeleteRotateUser(t *testing.T) {
 	}
 	if _, ok := svc.ValidateToken(ctx, "Bearer "+newToken); ok {
 		t.Fatal("deleted user token should be invalid")
+	}
+}
+
+func TestUserLimitsAndUsage(t *testing.T) {
+	db := openTestDB(t)
+	svc, err := auth.New(db, true, "owner-token")
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+
+	ctx := context.Background()
+	rec, token, err := svc.CreateUser(ctx, "metered", "user", auth.UserOptions{
+		QuotaBytes:    1024,
+		RateLimitMbps: 1.5,
+	})
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if rec.QuotaBytes != 1024 || rec.RateLimitMbps != 1.5 {
+		t.Fatalf("created limits = %+v", rec)
+	}
+
+	u, ok := svc.ValidateToken(ctx, "Bearer "+token)
+	if !ok {
+		t.Fatal("token did not validate")
+	}
+	if u.QuotaBytes != 1024 || u.RateLimitMbps != 1.5 {
+		t.Fatalf("validated limits = %+v", u)
+	}
+
+	if err := db.CreateTorrent(ctx, storage.TorrentRecord{
+		ID:        "USAGE001",
+		InfoHash:  "9999999999999999999999999999999999999999",
+		Status:    "downloaded",
+		AddedAt:   time.Now().UTC(),
+		OwnerID:   rec.ID,
+		OwnerName: rec.Name,
+		Files: []storage.TorrentFileRecord{
+			{ID: 1, Path: "/selected.mkv", Bytes: 600, Selected: true},
+			{ID: 2, Path: "/skipped.mkv", Bytes: 700, Selected: false},
+		},
+	}); err != nil {
+		t.Fatalf("create torrent: %v", err)
+	}
+
+	got, err := svc.GetUser(ctx, rec.ID)
+	if err != nil {
+		t.Fatalf("get user: %v", err)
+	}
+	if got.UsedBytes != 600 {
+		t.Fatalf("used bytes = %d, want 600", got.UsedBytes)
+	}
+
+	updated, err := svc.UpdateUserLimits(ctx, rec.ID, auth.UserOptions{
+		QuotaBytes:    2048,
+		RateLimitMbps: 0.75,
+	})
+	if err != nil {
+		t.Fatalf("update limits: %v", err)
+	}
+	if updated.QuotaBytes != 2048 || updated.RateLimitMbps != 0.75 || updated.UsedBytes != 600 {
+		t.Fatalf("updated user = %+v", updated)
 	}
 }
 

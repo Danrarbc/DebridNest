@@ -522,10 +522,12 @@ async function searchTorrentsDetailed(jackettUrl, jackettApiKey, meta, options =
 
   if (meta.type === 'series') {
     // Public indexers rarely support imdbid on tvsearch; text query is reliable.
-    await runVariant('series-title-episode', {
-      useImdb: false,
-      useTextQuery: true,
-    })
+    if (meta.title) {
+      await runVariant('series-title-episode', {
+        useImdb: false,
+        useTextQuery: true,
+      })
+    }
 
     if (merged.length === 0) {
       await runVariantsConcurrently([

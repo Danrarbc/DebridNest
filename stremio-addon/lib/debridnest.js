@@ -202,11 +202,10 @@ function pickVideoFile(files, target = {}) {
   if (hasEpisodeTarget(target) && videos.length > 1) {
     return null
   }
-  const candidates = videos.length ? videos : files
-  if (!candidates.length) {
+  if (!videos.length) {
     return null
   }
-  return candidates.reduce((best, file) => (file.bytes > best.bytes ? file : best))
+  return videos.reduce((best, file) => (file.bytes > best.bytes ? file : best))
 }
 
 function pickVideoFileIds(files, target = {}) {
@@ -225,7 +224,7 @@ function selectedVideoFile(info, target = {}) {
   if (picked || hasEpisodeTarget(target)) {
     return picked
   }
-  return selected[0]
+  return null
 }
 
 function pickHostLink(info, target = {}) {
@@ -245,6 +244,9 @@ function pickHostLink(info, target = {}) {
       }
     }
     if (hasEpisodeTarget(target)) {
+      return null
+    }
+    if (selected.length) {
       return null
     }
   }

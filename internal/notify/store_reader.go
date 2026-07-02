@@ -19,6 +19,7 @@ func (r StoreReader) NotifySettings() Settings {
 		GotifyURL:                merged.WebhookGotifyUrl,
 		GotifyToken:              merged.WebhookGotifyToken,
 		NotifyOnDownloadComplete: merged.NotifyOnDownloadComplete,
+		NotifyOnTorrentProblem:   merged.NotifyOnTorrentProblem,
 		NotifyOnQuotaWarning:     merged.NotifyOnQuotaWarning,
 	}
 }

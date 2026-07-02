@@ -57,7 +57,12 @@ func main() {
 	defer manager.Close()
 
 	notifier := notify.New(notify.StoreReader{Store: settingsStore})
-	manager.SetHooks(&torrent.Hooks{OnDownloadComplete: notifier.NotifyDownloadComplete})
+	manager.SetHooks(&torrent.Hooks{
+		OnDownloadComplete: notifier.NotifyDownloadComplete,
+		OnTorrentProblem: func(problem torrent.TorrentProblem) {
+			notifier.NotifyTorrentProblem(problem.Name, problem.Status)
+		},
+	})
 
 	retentionRunner := retention.NewRunner(cfg, manager, settingsStore)
 	retentionRunner.SetQuotaWarningHook(notifier.NotifyQuotaWarning)

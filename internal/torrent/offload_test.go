@@ -212,6 +212,39 @@ func TestCompletedOffloadRemovesAlreadyRemoteLocalFile(t *testing.T) {
 	}
 }
 
+func TestCompletedOffloadKeepsMarkedLocalFile(t *testing.T) {
+	manager, _ := testManager(t)
+	ctx := context.Background()
+	localPath := filepath.Join(t.TempDir(), "movie.mkv")
+	if err := os.WriteFile(localPath, []byte("data"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	rec := storage.TorrentRecord{
+		ID:       "OFFLOAD_KEEP",
+		InfoHash: "1212121212121212121212121212121212121212",
+		Files: []storage.TorrentFileRecord{
+			{
+				ID:           1,
+				TorrentID:    "OFFLOAD_KEEP",
+				Path:         "/movie.mkv",
+				Bytes:        4,
+				Selected:     true,
+				DiskPath:     localPath,
+				ObjectKey:    "remote/movie.mkv",
+				RemoteStored: true,
+				KeepLocal:    true,
+			},
+		},
+	}
+
+	manager.offloadFiles(ctx, nil, &rec, true)
+
+	if _, err := os.Stat(localPath); err != nil {
+		t.Fatalf("keep-local file was removed: %v", err)
+	}
+}
+
 func TestOffloadSkipsUploadWhenObjectStorageQuotaExceeded(t *testing.T) {
 	manager, db := testManager(t)
 	ctx := context.Background()

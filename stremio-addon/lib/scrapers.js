@@ -117,6 +117,38 @@ async function searchAllDetailed(config, meta) {
       deduped: 0,
     }
 
+    if (
+      torrents.length === 0
+      && meta.type === 'series'
+      && meta.season != null
+      && meta.episode != null
+      && config.jackettUrl
+      && config.jackettApiKey
+    ) {
+      const seasonMeta = { ...meta, episode: null }
+      const broad = await jackett.searchTorrentsDetailed(
+        config.jackettUrl,
+        config.jackettApiKey,
+        seasonMeta,
+      ).catch((err) => {
+        console.warn(`[scrapers] broad season search failed: ${err?.message || err}`)
+        return { torrents: [], diagnostics: { rawCount: 0, queries: [] } }
+      })
+      const filtered = (broad.torrents || []).filter((torrent) =>
+        rank.matchesEpisode(torrent.title, meta)
+        || seasonPacks.isSeasonPackForMeta(torrent.title, meta),
+      )
+      if (filtered.length) {
+        console.warn(
+          `[scrapers] Broad S${meta.season} search found ${filtered.length} candidate(s) for`
+          + ` ${meta.title || meta.imdbId} S${meta.season}E${meta.episode}`,
+        )
+        torrents = filtered
+        counts.raw += Number(broad.diagnostics?.rawCount || 0)
+        counts.search = torrents.length
+      }
+    }
+
     if (torrents.length === 0) {
       console.warn('[scrapers] search returned 0 results — check Jackett/Prowlarr indexers')
     }

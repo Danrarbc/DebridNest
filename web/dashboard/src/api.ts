@@ -54,6 +54,9 @@ export interface Torrent {
   seeders: number;
   added: string;
   ended?: string;
+  pinned?: boolean;
+  favorite?: boolean;
+  retentionExempt?: boolean;
 }
 
 export interface TorrentFile {
@@ -63,11 +66,142 @@ export interface TorrentFile {
   selected: boolean | number;
   downloadedBytes: number;
   streamableBytes?: number;
+  linksVisible?: boolean;
+  objectKey?: string;
+  remoteStored?: boolean;
+  keepLocal?: boolean;
+  localStored?: boolean;
+  storageState?: string;
+  storagePolicy?: string;
 }
 
 export interface TorrentDetail extends Torrent {
   files: TorrentFile[];
   links: string[];
+}
+
+export type LibraryFilter = 'all' | 'favorites' | 'pinned' | 'protected' | 'unprotected';
+
+export type LibrarySort = 'recent' | 'name' | 'size' | 'added';
+
+export interface LibraryQuery {
+  q?: string;
+  filter?: LibraryFilter;
+  sort?: LibrarySort;
+  dir?: 'asc' | 'desc';
+  limit?: number;
+}
+
+export interface LibraryItem extends Torrent {
+  links: string[];
+  fileCount: number;
+  selectedFileCount: number;
+  selectedBytes: number;
+}
+
+export interface LibraryDetail extends LibraryItem {
+  files: TorrentFile[];
+}
+
+export interface LibraryStatePatch {
+  pinned?: boolean;
+  favorite?: boolean;
+  retentionExempt?: boolean;
+}
+
+export interface StoragePolicy {
+  enabled: boolean;
+  quotaBytes: number;
+  quotaGb: number;
+  usedBytes: number;
+  reservedBytes: number;
+  objectCount: number;
+  offloadLocal: boolean;
+  earlyOffload: boolean;
+}
+
+export interface StorageObjectEntry {
+  key: string;
+  name: string;
+  directory: boolean;
+  bytes: number;
+  lastModified?: string;
+  torrentId?: string;
+  torrentName?: string;
+  fileId?: number;
+  filePath?: string;
+  remoteStored?: boolean;
+  keepLocal?: boolean;
+  localStored?: boolean;
+}
+
+export interface StorageObjectsResponse {
+  enabled: boolean;
+  bucket?: string;
+  prefix?: string;
+  basePrefix?: string;
+  truncated?: boolean;
+  nextToken?: string;
+  entries: StorageObjectEntry[];
+  policy: StoragePolicy;
+}
+
+export interface StorageRecordEntry {
+  torrentId: string;
+  torrentName: string;
+  hash: string;
+  status: string;
+  fileId: number;
+  path: string;
+  bytes: number;
+  objectKey: string;
+  remoteStored: boolean;
+  keepLocal: boolean;
+  localStored: boolean;
+  objectBytes?: number;
+  objectModified?: string;
+  error?: string;
+}
+
+export interface StorageReconcileResponse {
+  enabled: boolean;
+  bucket?: string;
+  prefix?: string;
+  checkedAt: string;
+  dbRemoteCount: number;
+  objectCount: number;
+  matchedCount: number;
+  truncated: boolean;
+  missingRemote: StorageRecordEntry[];
+  sizeMismatches: StorageRecordEntry[];
+  orphanedRemote: StorageObjectEntry[];
+  unmarkedRemote: StorageRecordEntry[];
+  policy: StoragePolicy;
+}
+
+export interface FileStoragePolicyPatch {
+  keepLocal?: boolean;
+  offloadOnly?: boolean;
+}
+
+export interface RSSImport {
+  id: string;
+  name: string;
+  url: string;
+  enabled: boolean;
+  createdAt: string;
+  lastRunAt?: string;
+  lastResult: string;
+  lastAdded: number;
+  lastError: string;
+}
+
+export interface RSSImportRunResult {
+  id: string;
+  checkedAt: string;
+  found: number;
+  added: number;
+  errors: string[];
 }
 
 export interface Config {
@@ -187,6 +321,33 @@ export function fetchTorrentDetail(id: string): Promise<TorrentDetail> {
   return request<TorrentDetail>(`/api/v1/torrents/${encodeURIComponent(id)}`);
 }
 
+function libraryQueryString(query: LibraryQuery): string {
+  const params = new URLSearchParams();
+  if (query.q?.trim()) params.set('q', query.q.trim());
+  if (query.filter && query.filter !== 'all') params.set('filter', query.filter);
+  if (query.sort) params.set('sort', query.sort);
+  if (query.dir) params.set('dir', query.dir);
+  if (query.limit) params.set('limit', String(query.limit));
+  const encoded = params.toString();
+  return encoded ? `?${encoded}` : '';
+}
+
+export function fetchLibraryItems(query: LibraryQuery = {}): Promise<LibraryItem[]> {
+  return request<LibraryItem[]>(`/api/v1/library${libraryQueryString(query)}`);
+}
+
+export function fetchLibraryItem(id: string): Promise<LibraryDetail> {
+  return request<LibraryDetail>(`/api/v1/library/${encodeURIComponent(id)}`);
+}
+
+export function patchLibraryItem(id: string, patch: LibraryStatePatch): Promise<LibraryDetail> {
+  return request<LibraryDetail>(`/api/v1/library/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+}
+
 export function deleteTorrent(id: string): Promise<void> {
   return request<void>(`/api/v1/torrents/${encodeURIComponent(id)}`, {
     method: 'DELETE',
@@ -267,9 +428,13 @@ export function joinUrl(base: string, path: string): string {
 }
 
 export interface Me {
+  id: string;
   name: string;
   role: string;
   admin: boolean;
+  quotaBytes?: number;
+  usedBytes?: number;
+  rateLimitMbps?: number;
 }
 
 export interface Settings {
@@ -281,6 +446,7 @@ export interface Settings {
   webhookGotifyUrl?: string;
   webhookGotifyToken?: string;
   notifyOnDownloadComplete?: boolean;
+  notifyOnTorrentProblem?: boolean;
   notifyOnQuotaWarning?: boolean;
   s3Enabled?: boolean;
   s3QuotaGb?: number;
@@ -303,6 +469,7 @@ export interface SettingsPatch {
   webhookGotifyUrl?: string;
   webhookGotifyToken?: string;
   notifyOnDownloadComplete?: boolean;
+  notifyOnTorrentProblem?: boolean;
   notifyOnQuotaWarning?: boolean;
   s3Enabled?: boolean;
   s3QuotaGb?: number;
@@ -322,11 +489,16 @@ export interface DashboardUser {
   role: string;
   disabled?: boolean;
   createdAt?: string;
+  quotaBytes?: number;
+  usedBytes?: number;
+  rateLimitMbps?: number;
 }
 
 export interface CreateUserRequest {
   name: string;
   role?: string;
+  quotaGb?: number;
+  rateLimitMbps?: number;
 }
 
 export interface CreateUserResponse {
@@ -338,6 +510,12 @@ export interface CreateUserResponse {
 
 export interface RotateTokenResponse {
   token: string;
+}
+
+export interface UpdateUserLimitsRequest {
+  quotaBytes?: number;
+  quotaGb?: number;
+  rateLimitMbps?: number;
 }
 
 export interface ActivityEvent {
@@ -369,6 +547,65 @@ export function testS3Settings(): Promise<{ ok: boolean }> {
   return request<{ ok: boolean }>('/api/v1/settings/s3-test', { method: 'POST' });
 }
 
+export function fetchStorageObjects(prefix = ''): Promise<StorageObjectsResponse> {
+  const params = new URLSearchParams();
+  if (prefix.trim()) params.set('prefix', prefix.trim());
+  return request<StorageObjectsResponse>(
+    `/api/v1/storage/objects${params.toString() ? `?${params}` : ''}`,
+  );
+}
+
+export function reconcileStorage(prefix = ''): Promise<StorageReconcileResponse> {
+  const params = new URLSearchParams();
+  if (prefix.trim()) params.set('prefix', prefix.trim());
+  return request<StorageReconcileResponse>(
+    `/api/v1/storage/reconcile${params.toString() ? `?${params}` : ''}`,
+  );
+}
+
+export function patchTorrentFileStorage(
+  torrentId: string,
+  fileId: number | string,
+  patch: FileStoragePolicyPatch,
+): Promise<TorrentFile> {
+  return request<TorrentFile>(
+    `/api/v1/torrents/${encodeURIComponent(torrentId)}/files/${encodeURIComponent(String(fileId))}/storage`,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    },
+  );
+}
+
+export function fetchRSSImports(): Promise<RSSImport[]> {
+  return request<RSSImport[]>('/api/v1/imports/rss');
+}
+
+export function createRSSImport(body: {
+  name: string;
+  url: string;
+  enabled?: boolean;
+}): Promise<RSSImport> {
+  return request<RSSImport>('/api/v1/imports/rss', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+export function runRSSImport(id: string): Promise<RSSImportRunResult> {
+  return request<RSSImportRunResult>(`/api/v1/imports/rss/${encodeURIComponent(id)}/run`, {
+    method: 'POST',
+  });
+}
+
+export function deleteRSSImport(id: string): Promise<void> {
+  return request<void>(`/api/v1/imports/rss/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  });
+}
+
 export function fetchUsers(): Promise<DashboardUser[]> {
   return request<DashboardUser[]>('/api/v1/users');
 }
@@ -384,6 +621,17 @@ export function createUser(body: CreateUserRequest): Promise<CreateUserResponse>
 export function deleteUser(id: string): Promise<void> {
   return request<void>(`/api/v1/users/${encodeURIComponent(id)}`, {
     method: 'DELETE',
+  });
+}
+
+export function updateUserLimits(
+  id: string,
+  body: UpdateUserLimitsRequest,
+): Promise<DashboardUser> {
+  return request<DashboardUser>(`/api/v1/users/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
   });
 }
 

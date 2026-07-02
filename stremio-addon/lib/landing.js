@@ -1,3 +1,5 @@
+const { manifestDefaultValues } = require('./configPath')
+
 const STYLESHEET = `
 * {
 	box-sizing: border-box;
@@ -193,6 +195,14 @@ button:active {
 }
 `
 
+function escapeAttribute(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+}
+
 function landingTemplate(manifest) {
   const background = manifest.background || 'https://dl.strem.io/addon-background.jpg'
   const logo = manifest.logo || 'https://dl.strem.io/addon-logo.png'
@@ -234,9 +244,12 @@ function landingTemplate(manifest) {
 				`
       } else if (elem.type === 'select') {
         const defaultValue = elem.default || (elem.options || [])[0]
+        const presetData = elem.presets
+          ? ` data-presets="${escapeAttribute(JSON.stringify(elem.presets))}"`
+          : ''
         options += `<div class="form-element">
 				<div class="label-to-top">${elem.title}</div>
-				<select id="${key}" name="${key}" class="full-width">
+				<select id="${key}" name="${key}" class="full-width"${presetData}>
 				`
         const selections = elem.options || []
         selections.forEach((el) => {
@@ -256,15 +269,31 @@ function landingTemplate(manifest) {
 
 			<div class="separator"></div>
 			`
+      const manifestDefaults = manifestDefaultValues(manifest)
       script += `
 			installLink.onclick = () => {
 				return mainForm.reportValidity()
 			}
+			const manifestDefaults = ${JSON.stringify(manifestDefaults)}
 			const buildConfig = () => {
 				const config = Object.fromEntries(new FormData(mainForm))
 				mainForm.querySelectorAll('input[type=checkbox]').forEach((cb) => {
 					config[cb.name] = cb.checked ? 'true' : 'false'
 				})
+				for (const [key, defaultValue] of Object.entries(manifestDefaults)) {
+					if (config[key] === defaultValue) {
+						delete config[key]
+					}
+				}
+				for (const key of ['apiUrl', 'jackettUrl']) {
+					delete config[key]
+				}
+				for (const [key, value] of Object.entries({ ...config })) {
+					if (value === '' || value === undefined || value === null) {
+						delete config[key]
+					}
+				}
+				config.installRev = '${manifest.version || '0'}'
 				return config
 			}
 			const updateLink = () => {
@@ -273,6 +302,35 @@ function landingTemplate(manifest) {
 				installLink.href = 'stremio://' + window.location.host + '/' + path + '/manifest.json'
 				webManifestUrl.value = httpUrl
 			}
+			const applyPreset = (select) => {
+				let presets = {}
+				try {
+					presets = JSON.parse(select.dataset.presets || '{}')
+				} catch {
+					return
+				}
+				const values = presets[select.value]
+				if (!values) {
+					return
+				}
+				Object.entries(values).forEach(([name, value]) => {
+					const field = mainForm.elements[name]
+					if (!field) {
+						return
+					}
+					if (field.type === 'checkbox') {
+						field.checked = value === true || value === 'true' || value === '1'
+					} else {
+						field.value = value
+					}
+				})
+			}
+			mainForm.querySelectorAll('select[data-presets]').forEach((select) => {
+				select.addEventListener('change', () => {
+					applyPreset(select)
+					updateLink()
+				})
+			})
 			mainForm.onchange = updateLink
 			mainForm.oninput = updateLink
 			copyWebUrl.onclick = async () => {

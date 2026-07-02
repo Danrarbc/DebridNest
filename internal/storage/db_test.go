@@ -18,7 +18,8 @@ func TestOpenRunsMigrationsOnce(t *testing.T) {
 		t.Fatalf("open fresh db: %v", err)
 	}
 	assertRecordedMigrations(t, db, want)
-	assertColumnsExist(t, db.DB, "torrent_files", "object_key", "remote_stored", "streamable_bytes")
+	assertColumnsExist(t, db.DB, "torrent_files", "object_key", "remote_stored", "streamable_bytes", "keep_local")
+	assertColumnsExist(t, db.DB, "torrents", "library_pinned", "library_favorite", "retention_exempt")
 	if err := db.Close(); err != nil {
 		t.Fatalf("close fresh db: %v", err)
 	}
@@ -29,7 +30,8 @@ func TestOpenRunsMigrationsOnce(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	assertRecordedMigrations(t, db, want)
-	assertColumnsExist(t, db.DB, "torrent_files", "object_key", "remote_stored", "streamable_bytes")
+	assertColumnsExist(t, db.DB, "torrent_files", "object_key", "remote_stored", "streamable_bytes", "keep_local")
+	assertColumnsExist(t, db.DB, "torrents", "library_pinned", "library_favorite", "retention_exempt")
 }
 
 func TestOpenBootstrapsLegacyDatabaseWithObjectStorageColumns(t *testing.T) {
@@ -43,7 +45,8 @@ func TestOpenBootstrapsLegacyDatabaseWithObjectStorageColumns(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 
 	assertRecordedMigrations(t, db, migrationNames(t))
-	assertColumnsExist(t, db.DB, "torrent_files", "object_key", "remote_stored", "streamable_bytes")
+	assertColumnsExist(t, db.DB, "torrent_files", "object_key", "remote_stored", "streamable_bytes", "keep_local")
+	assertColumnsExist(t, db.DB, "torrents", "library_pinned", "library_favorite", "retention_exempt")
 }
 
 func TestOpenRepairsPartialLegacyObjectStorageMigration(t *testing.T) {
@@ -65,7 +68,8 @@ func TestOpenRepairsPartialLegacyObjectStorageMigration(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 
 	assertRecordedMigrations(t, db, migrationNames(t))
-	assertColumnsExist(t, db.DB, "torrent_files", "object_key", "remote_stored", "streamable_bytes")
+	assertColumnsExist(t, db.DB, "torrent_files", "object_key", "remote_stored", "streamable_bytes", "keep_local")
+	assertColumnsExist(t, db.DB, "torrents", "library_pinned", "library_favorite", "retention_exempt")
 }
 
 func TestFailedMagnetConversionsAreNotIncompleteOrActive(t *testing.T) {
@@ -143,6 +147,49 @@ func TestTorrentFileStreamableBytesRoundTrip(t *testing.T) {
 	}
 	if got.Files[0].StreamableBytes != 48 {
 		t.Fatalf("streamable bytes after update = %d, want 48", got.Files[0].StreamableBytes)
+	}
+}
+
+func TestTorrentFileKeepLocalRoundTrip(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	ctx := t.Context()
+	rec := TorrentRecord{
+		ID:       "KEEPLOCAL01",
+		InfoHash: "5555555555555555555555555555555555555555",
+		Magnet:   "magnet:?xt=urn:btih:5555555555555555555555555555555555555555",
+		Status:   "downloaded",
+		AddedAt:  time.Now().UTC(),
+		Files: []TorrentFileRecord{
+			{ID: 1, Path: "/movie.mkv", Bytes: 100, Selected: true, KeepLocal: true},
+		},
+	}
+	if err := db.CreateTorrent(ctx, rec); err != nil {
+		t.Fatalf("create torrent: %v", err)
+	}
+
+	got, err := db.GetTorrent(ctx, rec.ID)
+	if err != nil {
+		t.Fatalf("get torrent: %v", err)
+	}
+	if len(got.Files) != 1 || !got.Files[0].KeepLocal {
+		t.Fatalf("keep local after create = %+v, want true", got.Files)
+	}
+
+	got.Files[0].KeepLocal = false
+	if err := db.UpdateTorrentFiles(ctx, got.ID, got.Files); err != nil {
+		t.Fatalf("update files: %v", err)
+	}
+	got, err = db.GetTorrent(ctx, rec.ID)
+	if err != nil {
+		t.Fatalf("get updated torrent: %v", err)
+	}
+	if got.Files[0].KeepLocal {
+		t.Fatalf("keep local after update = %v, want false", got.Files[0].KeepLocal)
 	}
 }
 

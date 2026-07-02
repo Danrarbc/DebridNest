@@ -1,17 +1,29 @@
 import { type FormEvent, type SetStateAction, useCallback, useEffect, useState } from 'react';
 import {
+  createRSSImport,
+  deleteRSSImport,
   fetchConfig,
+  fetchRSSImports,
   fetchSettings,
+  fetchStorageObjects,
   fetchSystem,
   joinUrl,
   patchSettings,
+  patchTorrentFileStorage,
   purgeTorrents,
+  reconcileStorage,
   runCleanup,
+  runRSSImport,
   testS3Settings,
   type Config,
   type RetentionResult,
+  type RSSImport,
   type Settings,
   type SettingsPatch,
+  type StorageObjectEntry,
+  type StorageObjectsResponse,
+  type StorageReconcileResponse,
+  type StorageRecordEntry,
   type SystemInfo,
 } from '../api';
 import CopyButton from '../components/CopyButton';
@@ -66,6 +78,7 @@ function settingsToForm(settings: Settings) {
     webhookGotifyUrl: settings.webhookGotifyUrl ?? '',
     webhookGotifyToken: settings.webhookGotifyToken ?? '',
     notifyOnDownloadComplete: settings.notifyOnDownloadComplete ?? false,
+    notifyOnTorrentProblem: settings.notifyOnTorrentProblem ?? false,
     notifyOnQuotaWarning: settings.notifyOnQuotaWarning ?? false,
     s3Enabled: settings.s3Enabled ?? false,
     s3QuotaGb: String(settings.s3QuotaGb ?? 0),
@@ -92,6 +105,7 @@ function defaultSettingsForm(): SettingsForm {
     webhookGotifyUrl: '',
     webhookGotifyToken: '',
     notifyOnDownloadComplete: false,
+    notifyOnTorrentProblem: false,
     notifyOnQuotaWarning: false,
     s3Enabled: false,
     s3QuotaGb: '0',
@@ -104,6 +118,513 @@ function defaultSettingsForm(): SettingsForm {
     s3ForcePathStyle: false,
     s3OffloadLocal: false,
   };
+}
+
+function formatStorageDate(value?: string): string {
+  if (!value) return '—';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '—' : date.toLocaleString();
+}
+
+function storagePolicyLabel(data: StorageObjectsResponse | StorageReconcileResponse | null): string {
+  const policy = data?.policy;
+  if (!policy?.enabled) return 'Disabled';
+  const quota = policy.quotaBytes > 0 ? formatBytes(policy.quotaBytes) : 'Unlimited';
+  return `${formatBytes(policy.usedBytes)} used / ${quota}`;
+}
+
+function RecordFindingList({
+  title,
+  records,
+}: {
+  title: string;
+  records: StorageRecordEntry[];
+}) {
+  if (records.length === 0) return null;
+  return (
+    <div className="storage-finding-group">
+      <h3>{title}</h3>
+      <ul className="storage-finding-list">
+        {records.slice(0, 5).map((item) => (
+          <li key={`${item.torrentId}-${item.fileId}-${item.objectKey}`}>
+            <code>{item.objectKey || item.path}</code>
+            <span className="muted">{item.error || item.torrentName || item.torrentId}</span>
+          </li>
+        ))}
+      </ul>
+      {records.length > 5 && <p className="muted hint-text">+{records.length - 5} more</p>}
+    </div>
+  );
+}
+
+function ObjectFindingList({
+  title,
+  objects,
+}: {
+  title: string;
+  objects: StorageObjectEntry[];
+}) {
+  if (objects.length === 0) return null;
+  return (
+    <div className="storage-finding-group">
+      <h3>{title}</h3>
+      <ul className="storage-finding-list">
+        {objects.slice(0, 5).map((item) => (
+          <li key={item.key}>
+            <code>{item.key}</code>
+            <span className="muted">{formatBytes(item.bytes)}</span>
+          </li>
+        ))}
+      </ul>
+      {objects.length > 5 && <p className="muted hint-text">+{objects.length - 5} more</p>}
+    </div>
+  );
+}
+
+function StorageAdminPanel() {
+  const { toast } = useToast();
+  const [prefix, setPrefix] = useState('');
+  const [objects, setObjects] = useState<StorageObjectsResponse | null>(null);
+  const [reconcile, setReconcile] = useState<StorageReconcileResponse | null>(null);
+  const [loadingObjects, setLoadingObjects] = useState(false);
+  const [reconcileBusy, setReconcileBusy] = useState(false);
+  const [rowBusy, setRowBusy] = useState<string | null>(null);
+
+  const loadObjects = useCallback(
+    async (nextPrefix: string) => {
+      setLoadingObjects(true);
+      try {
+        const result = await fetchStorageObjects(nextPrefix);
+        setObjects(result);
+        setPrefix(result.prefix ?? nextPrefix);
+      } catch (err) {
+        toast(err instanceof Error ? err.message : 'Object browser failed', 'error');
+      } finally {
+        setLoadingObjects(false);
+      }
+    },
+    [toast],
+  );
+
+  useEffect(() => {
+    void loadObjects('');
+  }, [loadObjects]);
+
+  async function handleReconcile() {
+    setReconcileBusy(true);
+    try {
+      const result = await reconcileStorage(prefix);
+      setReconcile(result);
+      setObjects((current) => (current ? { ...current, policy: result.policy } : current));
+      toast('Storage reconciliation complete');
+    } catch (err) {
+      toast(err instanceof Error ? err.message : 'Reconciliation failed', 'error');
+    } finally {
+      setReconcileBusy(false);
+    }
+  }
+
+  async function updateFilePolicy(entry: StorageObjectEntry, patch: { keepLocal?: boolean; offloadOnly?: boolean }) {
+    if (!entry.torrentId || entry.fileId == null) return;
+    const busyKey = `${entry.torrentId}:${entry.fileId}`;
+    setRowBusy(busyKey);
+    try {
+      await patchTorrentFileStorage(entry.torrentId, entry.fileId, patch);
+      await loadObjects(prefix);
+      toast(patch.offloadOnly ? 'File set to offload-only' : 'Storage policy updated');
+    } catch (err) {
+      toast(err instanceof Error ? err.message : 'Policy update failed', 'error');
+    } finally {
+      setRowBusy(null);
+    }
+  }
+
+  const policy = objects?.policy ?? reconcile?.policy;
+  const entries = objects?.entries ?? [];
+  const findingCount = reconcile
+    ? reconcile.missingRemote.length +
+      reconcile.sizeMismatches.length +
+      reconcile.orphanedRemote.length +
+      reconcile.unmarkedRemote.length
+    : 0;
+
+  return (
+    <section className="card storage-panel">
+      <div className="card-heading">
+        <h2>Storage browser</h2>
+        <div className="storage-actions">
+          <button
+            type="button"
+            className="btn btn-secondary btn-sm"
+            disabled={loadingObjects}
+            onClick={() => loadObjects(prefix)}
+          >
+            <Icon name="rotate-cw" size={14} />
+            {loadingObjects ? 'Loading…' : 'Refresh'}
+          </button>
+          <button
+            type="button"
+            className="btn btn-secondary btn-sm"
+            disabled={reconcileBusy}
+            onClick={handleReconcile}
+          >
+            <Icon name="search" size={14} />
+            {reconcileBusy ? 'Checking…' : 'Reconcile'}
+          </button>
+        </div>
+      </div>
+
+      <div className="config-grid storage-policy-grid">
+        <ConfigRow label="Object storage" value={objects?.enabled ? 'Enabled' : 'Disabled'} />
+        <ConfigRow label="Quota policy" value={storagePolicyLabel(objects ?? reconcile)} />
+        <ConfigRow
+          label="Reserved"
+          value={policy ? `${formatBytes(policy.reservedBytes)} reserved` : '—'}
+        />
+        <ConfigRow
+          label="Offload behavior"
+          value={policy?.offloadLocal ? 'Delete local by default' : 'Keep local by default'}
+        />
+        <ConfigRow
+          label="Early offload"
+          value={policy?.earlyOffload ? 'Enabled' : 'Disabled'}
+        />
+        <ConfigRow
+          label="Objects tracked"
+          value={policy ? `${policy.objectCount} object${policy.objectCount === 1 ? '' : 's'}` : '—'}
+        />
+      </div>
+
+      <div className="storage-prefix-row">
+        <div className="form-group">
+          <label htmlFor="storage-prefix">Prefix</label>
+          <input
+            id="storage-prefix"
+            className="input input-mono"
+            value={prefix}
+            placeholder="bucket prefix"
+            onChange={(e) => setPrefix(e.target.value)}
+          />
+        </div>
+        <button
+          type="button"
+          className="btn btn-secondary"
+          disabled={loadingObjects}
+          onClick={() => loadObjects(prefix)}
+        >
+          Browse
+        </button>
+      </div>
+
+      {!objects?.enabled && (
+        <p className="muted hint-text">Enable object storage and save settings to browse a bucket.</p>
+      )}
+
+      {objects?.enabled && entries.length === 0 && !loadingObjects && (
+        <p className="muted hint-text">No objects found for this prefix.</p>
+      )}
+
+      {entries.length > 0 && (
+        <div className="table-wrap storage-table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Object</th>
+                <th>Size</th>
+                <th>Modified</th>
+                <th>Status</th>
+                <th className="actions-cell">Policy</th>
+              </tr>
+            </thead>
+            <tbody>
+              {entries.map((entry) => {
+                const busyKey =
+                  entry.torrentId && entry.fileId != null
+                    ? `${entry.torrentId}:${entry.fileId}`
+                    : '';
+                const linked = Boolean(entry.torrentId && entry.fileId != null);
+                return (
+                  <tr key={entry.key}>
+                    <td className="name-cell">
+                      {entry.directory ? (
+                        <button
+                          type="button"
+                          className="storage-prefix-button"
+                          onClick={() => loadObjects(entry.key)}
+                        >
+                          <Icon name="chevron-right" size={14} />
+                          {entry.name || entry.key}
+                        </button>
+                      ) : (
+                        <>
+                          <span className="name-primary">{entry.name || entry.key}</span>
+                          <span className="name-meta">{entry.key}</span>
+                          {entry.torrentName && (
+                            <span className="name-meta">{entry.torrentName}</span>
+                          )}
+                        </>
+                      )}
+                    </td>
+                    <td className="num-cell">{entry.directory ? '—' : formatBytes(entry.bytes)}</td>
+                    <td>{entry.directory ? '—' : formatStorageDate(entry.lastModified)}</td>
+                    <td>
+                      {entry.directory ? (
+                        <span className="pill pill-muted">folder</span>
+                      ) : linked ? (
+                        <span className="storage-pills">
+                          <span className="pill pill-live">tracked</span>
+                          <span className={entry.localStored ? 'pill pill-accent' : 'pill pill-muted'}>
+                            {entry.localStored ? 'local' : 'remote-only'}
+                          </span>
+                        </span>
+                      ) : (
+                        <span className="pill pill-warning">untracked</span>
+                      )}
+                    </td>
+                    <td className="actions-cell">
+                      {!entry.directory && linked && (
+                        <div className="storage-row-actions">
+                          <label className="storage-check">
+                            <input
+                              type="checkbox"
+                              checked={Boolean(entry.keepLocal)}
+                              disabled={rowBusy === busyKey}
+                              onChange={(e) =>
+                                updateFilePolicy(entry, { keepLocal: e.currentTarget.checked })
+                              }
+                            />
+                            Keep local
+                          </label>
+                          <button
+                            type="button"
+                            className="btn btn-secondary btn-sm"
+                            disabled={rowBusy === busyKey || !entry.localStored}
+                            onClick={() => updateFilePolicy(entry, { offloadOnly: true })}
+                          >
+                            Offload only
+                          </button>
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {objects?.truncated && (
+        <p className="muted hint-text">Object list is truncated. Narrow the prefix to inspect more.</p>
+      )}
+
+      {reconcile && (
+        <div className="storage-reconcile">
+          <div className="storage-reconcile-summary">
+            <span className={findingCount > 0 ? 'pill pill-warning' : 'pill pill-live'}>
+              {findingCount} finding{findingCount === 1 ? '' : 's'}
+            </span>
+            <span className="muted">
+              {reconcile.matchedCount} matched · {reconcile.dbRemoteCount} DB remote ·{' '}
+              {reconcile.objectCount} bucket objects
+            </span>
+          </div>
+          <div className="storage-finding-grid">
+            <RecordFindingList title="Missing remote" records={reconcile.missingRemote} />
+            <RecordFindingList title="Size mismatch" records={reconcile.sizeMismatches} />
+            <ObjectFindingList title="Orphaned remote" objects={reconcile.orphanedRemote} />
+            <RecordFindingList title="Unmarked remote" records={reconcile.unmarkedRemote} />
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function RSSImportsPanel() {
+  const { toast } = useToast();
+  const [items, setItems] = useState<RSSImport[]>([]);
+  const [name, setName] = useState('');
+  const [url, setUrl] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [busyId, setBusyId] = useState<string | null>(null);
+
+  const loadImports = useCallback(async () => {
+    setLoading(true);
+    try {
+      setItems(await fetchRSSImports());
+    } catch (err) {
+      toast(err instanceof Error ? err.message : 'Failed to load RSS imports', 'error');
+    } finally {
+      setLoading(false);
+    }
+  }, [toast]);
+
+  useEffect(() => {
+    void loadImports();
+  }, [loadImports]);
+
+  async function handleCreate(e: FormEvent) {
+    e.preventDefault();
+    const trimmedName = name.trim();
+    const trimmedUrl = url.trim();
+    if (!trimmedName || !trimmedUrl) {
+      toast('Name and URL are required', 'error');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      await createRSSImport({ name: trimmedName, url: trimmedUrl });
+      setName('');
+      setUrl('');
+      await loadImports();
+      toast('RSS import added');
+    } catch (err) {
+      toast(err instanceof Error ? err.message : 'Failed to add RSS import', 'error');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleRun(item: RSSImport) {
+    setBusyId(item.id);
+    try {
+      const result = await runRSSImport(item.id);
+      await loadImports();
+      toast(`RSS import checked ${result.found}, queued ${result.added}`);
+      if (result.errors.length > 0) {
+        toast(`${result.errors.length} item${result.errors.length === 1 ? '' : 's'} failed`, 'error');
+      }
+    } catch (err) {
+      toast(err instanceof Error ? err.message : 'RSS import failed', 'error');
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function handleDelete(item: RSSImport) {
+    if (!confirm(`Delete RSS import "${item.name}"?`)) return;
+    setBusyId(item.id);
+    try {
+      await deleteRSSImport(item.id);
+      setItems((current) => current.filter((entry) => entry.id !== item.id));
+      toast('RSS import deleted');
+    } catch (err) {
+      toast(err instanceof Error ? err.message : 'Delete failed', 'error');
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  return (
+    <section className="card imports-panel">
+      <div className="card-heading">
+        <h2>RSS imports</h2>
+        <button
+          type="button"
+          className="btn btn-secondary btn-sm"
+          disabled={loading}
+          onClick={() => loadImports()}
+        >
+          <Icon name="rotate-cw" size={14} />
+          Refresh
+        </button>
+      </div>
+      <p className="section-desc">
+        Add RSS or Torznab feeds that expose magnet links, then run them manually to queue new
+        torrents.
+      </p>
+      <form className="rss-import-form" onSubmit={handleCreate}>
+        <div className="form-group">
+          <label htmlFor="rss-import-name">Name</label>
+          <input
+            id="rss-import-name"
+            className="input"
+            value={name}
+            placeholder="Movie watchlist"
+            onChange={(e) => setName(e.target.value)}
+          />
+        </div>
+        <div className="form-group">
+          <label htmlFor="rss-import-url">Feed URL</label>
+          <input
+            id="rss-import-url"
+            className="input input-mono"
+            type="url"
+            value={url}
+            placeholder="https://indexer.example/rss"
+            onChange={(e) => setUrl(e.target.value)}
+          />
+        </div>
+        <button type="submit" className="btn btn-primary" disabled={loading}>
+          Add feed
+        </button>
+      </form>
+
+      {items.length === 0 ? (
+        <p className="muted hint-text">
+          {loading ? 'Loading imports…' : 'No RSS imports configured yet.'}
+        </p>
+      ) : (
+        <div className="table-wrap imports-table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Last run</th>
+                <th>Result</th>
+                <th className="actions-cell">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {items.map((item) => (
+                <tr key={item.id}>
+                  <td className="name-cell">
+                    <span className="name-primary">{item.name}</span>
+                    <span className="name-meta">{item.url}</span>
+                  </td>
+                  <td>{item.lastRunAt ? new Date(item.lastRunAt).toLocaleString() : 'Never'}</td>
+                  <td>
+                    <span className={item.lastError ? 'pill pill-warning' : 'pill pill-muted'}>
+                      {item.lastResult || 'Not run'}
+                    </span>
+                    {item.lastRunAt && (
+                      <span className="name-meta">
+                        {item.lastAdded} queued{item.lastError ? ` · ${item.lastError}` : ''}
+                      </span>
+                    )}
+                  </td>
+                  <td className="actions-cell">
+                    <span className="row-actions">
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        disabled={busyId === item.id}
+                        onClick={() => handleRun(item)}
+                      >
+                        Run now
+                      </button>
+                      <button
+                        type="button"
+                        className="icon-btn icon-btn-danger"
+                        title="Delete RSS import"
+                        aria-label={`Delete ${item.name}`}
+                        disabled={busyId === item.id}
+                        onClick={() => handleDelete(item)}
+                      >
+                        <Icon name="trash-2" size={18} />
+                      </button>
+                    </span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
 }
 
 interface SettingsProps {
@@ -157,6 +678,7 @@ export default function SettingsPage({ isAdmin }: SettingsProps) {
       webhookGotifyUrl: form.webhookGotifyUrl.trim(),
       webhookGotifyToken: form.webhookGotifyToken.trim(),
       notifyOnDownloadComplete: form.notifyOnDownloadComplete,
+      notifyOnTorrentProblem: form.notifyOnTorrentProblem,
       notifyOnQuotaWarning: form.notifyOnQuotaWarning,
     };
 
@@ -386,6 +908,12 @@ export default function SettingsPage({ isAdmin }: SettingsProps) {
               label="Notify on download complete"
             />
             <Toggle
+              checked={form.notifyOnTorrentProblem}
+              disabled={!isAdmin}
+              onChange={(checked) => setForm((f) => ({ ...f, notifyOnTorrentProblem: checked }))}
+              label="Notify on failed or stuck torrents"
+            />
+            <Toggle
               checked={form.notifyOnQuotaWarning}
               disabled={!isAdmin}
               onChange={(checked) => setForm((f) => ({ ...f, notifyOnQuotaWarning: checked }))}
@@ -522,6 +1050,10 @@ export default function SettingsPage({ isAdmin }: SettingsProps) {
             )}
           </section>
         )}
+
+        {isAdmin && <StorageAdminPanel />}
+
+        {isAdmin && <RSSImportsPanel />}
       </form>
 
       <section className="card">

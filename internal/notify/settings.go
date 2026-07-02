@@ -16,6 +16,7 @@ const (
 	keyGotifyURL      = "webhookGotifyUrl"
 	keyGotifyToken    = "webhookGotifyToken"
 	keyNotifyDownload = "notifyOnDownloadComplete"
+	keyNotifyProblem  = "notifyOnTorrentProblem"
 	keyNotifyQuota    = "notifyOnQuotaWarning"
 )
 
@@ -25,6 +26,7 @@ type Settings struct {
 	GotifyURL                string
 	GotifyToken              string
 	NotifyOnDownloadComplete bool
+	NotifyOnTorrentProblem   bool
 	NotifyOnQuotaWarning     bool
 }
 
@@ -50,6 +52,7 @@ func DefaultsFromEnv() Settings {
 		GotifyURL:                os.Getenv("DEBRIDNEST_WEBHOOK_GOTIFY_URL"),
 		GotifyToken:              os.Getenv("DEBRIDNEST_WEBHOOK_GOTIFY_TOKEN"),
 		NotifyOnDownloadComplete: envBool("DEBRIDNEST_NOTIFY_ON_DOWNLOAD_COMPLETE", true),
+		NotifyOnTorrentProblem:   envBool("DEBRIDNEST_NOTIFY_ON_TORRENT_PROBLEM", true),
 		NotifyOnQuotaWarning:     envBool("DEBRIDNEST_NOTIFY_ON_QUOTA_WARNING", true),
 	}
 }
@@ -77,6 +80,9 @@ func (r *DBSettingsReader) NotifySettings() Settings {
 	}
 	if v, ok := r.boolValue(keyNotifyDownload, cache); ok {
 		s.NotifyOnDownloadComplete = v
+	}
+	if v, ok := r.boolValue(keyNotifyProblem, cache); ok {
+		s.NotifyOnTorrentProblem = v
 	}
 	if v, ok := r.boolValue(keyNotifyQuota, cache); ok {
 		s.NotifyOnQuotaWarning = v

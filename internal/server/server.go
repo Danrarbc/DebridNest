@@ -64,6 +64,7 @@ func NewRouter(opts Options) (chi.Router, error) {
 		rdRoutes.ServeHTTP(w, req)
 	})
 	r.Handle("/dl/*", http.HandlerFunc(rdHandler.ServeDownloadPublic))
+	r.Handle("/share/{token}", http.HandlerFunc(adminHandler.ServeShareLink))
 
 	if err := webdav.Mount(r, opts.Config, opts.Manager); err != nil {
 		return nil, err

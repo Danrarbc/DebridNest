@@ -15,11 +15,12 @@ func AuthMiddleware(authSvc *auth.Service) func(http.Handler) http.Handler {
 				next.ServeHTTP(w, r)
 				return
 			}
-			if _, ok := authSvc.ValidateToken(r.Context(), r.Header.Get("Authorization")); !ok {
+			user, ok := authSvc.ValidateToken(r.Context(), r.Header.Get("Authorization"))
+			if !ok {
 				writeError(w, http.StatusUnauthorized, "bad_token")
 				return
 			}
-			next.ServeHTTP(w, r)
+			next.ServeHTTP(w, r.WithContext(auth.WithUser(r.Context(), user)))
 		})
 	}
 }

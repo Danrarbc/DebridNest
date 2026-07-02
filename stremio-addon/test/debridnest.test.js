@@ -38,6 +38,15 @@ test('movie/no-target selection keeps largest video fallback', () => {
   assert.equal(debridnest.pickVideoFileIds(baseFiles), '3')
 })
 
+test('selection ignores non-video payloads instead of picking largest file', () => {
+  assert.equal(
+    debridnest.pickVideoFileIds([
+      { id: 1, path: '/Backrooms.2026.1080p.scr', bytes: 1_300_000_000 },
+    ]),
+    '',
+  )
+})
+
 test('multi-video target with no match does not select arbitrary largest file', () => {
   assert.equal(
     debridnest.pickVideoFileIds(baseFiles, { season: 1, episode: 9 }),
@@ -52,6 +61,16 @@ test('host link aligns with selected target episode file', () => {
   }
   assert.equal(debridnest.pickHostLink(info, { season: 1, episode: 2 }), 'link-2')
   assert.equal(debridnest.pickHostLink(info, { season: 1, episode: 9 }), null)
+})
+
+test('host link selection rejects selected non-video payloads', () => {
+  const info = {
+    files: [
+      { id: 1, path: '/Backrooms.2026.1080p.scr', bytes: 1_300_000_000, selected: 1 },
+    ],
+    links: ['http://debridnest/d/bad'],
+  }
+  assert.equal(debridnest.pickHostLink(info), null)
 })
 
 test('magnet tracker appending preserves magnets that already have trackers', () => {

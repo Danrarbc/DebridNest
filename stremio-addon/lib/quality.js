@@ -7,6 +7,59 @@ function parseQuality(title) {
   return { resolution: 0, label: 'SD' }
 }
 
+function firstDefined(...values) {
+  return values.find((value) => value !== undefined && value !== null)
+}
+
+function splitFilterList(value) {
+  if (value === undefined || value === null || value === '') {
+    return []
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => splitFilterList(item))
+  }
+  return String(value)
+    .split(/[;,|]/u)
+    .map((part) => part.trim())
+    .filter(Boolean)
+}
+
+function normalizeQualityLabel(value) {
+  const normalized = String(value || '')
+    .toLowerCase()
+    .replace(/\s+/g, '')
+  if (!normalized || normalized === 'any' || normalized === 'all' || normalized === '*') {
+    return null
+  }
+  if (normalized === '4k' || normalized === 'uhd' || normalized === '2160' || normalized === '2160p') {
+    return '4K'
+  }
+  if (normalized === '1080' || normalized === '1080p' || normalized === 'fhd') {
+    return '1080p'
+  }
+  if (normalized === '720' || normalized === '720p' || normalized === 'hd') {
+    return '720p'
+  }
+  if (normalized === '480' || normalized === '480p') {
+    return '480p'
+  }
+  if (normalized === 'sd' || normalized === 'unknown') {
+    return 'SD'
+  }
+  return null
+}
+
+function parseQualityFilter(value) {
+  const labels = []
+  for (const item of splitFilterList(value)) {
+    const label = normalizeQualityLabel(item)
+    if (label && !labels.includes(label)) {
+      labels.push(label)
+    }
+  }
+  return labels
+}
+
 function parseHdrProfile(title) {
   const t = String(title || '').toLowerCase()
   if (/dolby\s*vision|\bdv\b|dovi/u.test(t)) return 'dv'
@@ -66,12 +119,33 @@ function resolveQualityConfig(userConfig = {}, defaults = {}) {
     maxFileSizeGb: parseMaxFileSizeGb(
       userConfig.maxFileSizeGb !== undefined ? userConfig.maxFileSizeGb : defaults.maxFileSizeGb,
     ),
+    qualityFilter: parseQualityFilter(firstDefined(
+      userConfig.qualityFilter,
+      userConfig.qualities,
+      userConfig.quality,
+      defaults.qualityFilter,
+      defaults.qualities,
+      defaults.quality,
+    )),
+    sourceFilter: firstDefined(
+      userConfig.sourceFilter,
+      userConfig.sources,
+      userConfig.source,
+      defaults.sourceFilter,
+      defaults.sources,
+      defaults.source,
+      '',
+    ),
   }
 }
 
 function passesQualityFilters(torrent, qualityConfig) {
-  const { maxResolution, maxFileSizeGb } = qualityConfig
+  const { maxResolution, maxFileSizeGb, qualityFilter = [] } = qualityConfig
   const quality = parseQuality(torrent.title)
+
+  if (qualityFilter.length && !qualityFilter.includes(quality.label)) {
+    return false
+  }
 
   if (maxResolution > 0) {
     const effective = quality.resolution || 480
@@ -149,6 +223,8 @@ module.exports = {
   parseMaxResolution,
   parseMaxFileSizeGb,
   parsePreferSdr,
+  parseQualityFilter,
+  normalizeQualityLabel,
   resolveQualityConfig,
   passesQualityFilters,
   hdrScoreAdjustment,

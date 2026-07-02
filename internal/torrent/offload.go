@@ -2,6 +2,7 @@ package torrent
 
 import (
 	"context"
+	"fmt"
 	"os"
 
 	"github.com/debridnest/debridnest/internal/objectstore"
@@ -46,7 +47,7 @@ func (m *Manager) offloadFiles(ctx context.Context, store *objectstore.Store, re
 	for i := range rec.Files {
 		f := rec.Files[i]
 		if f.RemoteStored {
-			if removeLocal {
+			if removeLocal && !f.KeepLocal {
 				removeLocalOffloadedFile(f)
 			}
 			continue
@@ -64,7 +65,7 @@ func (m *Manager) offloadFiles(ctx context.Context, store *objectstore.Store, re
 				continue
 			}
 			rec.Files = nextFiles
-			if removeLocal {
+			if removeLocal && !out.KeepLocal {
 				removeLocalOffloadedFile(out)
 			}
 			updated = append(updated, out)
@@ -94,27 +95,35 @@ func offloadCandidate(f storage.TorrentFileRecord) bool {
 }
 
 func (m *Manager) offloadOneFile(ctx context.Context, store *objectstore.Store, rec *storage.TorrentRecord, f storage.TorrentFileRecord) (bool, storage.TorrentFileRecord) {
-	if !offloadCandidate(f) {
+	changed, out, err := m.offloadOneFileStrict(ctx, store, rec, f)
+	if err != nil {
 		return false, f
+	}
+	return changed, out
+}
+
+func (m *Manager) offloadOneFileStrict(ctx context.Context, store *objectstore.Store, rec *storage.TorrentRecord, f storage.TorrentFileRecord) (bool, storage.TorrentFileRecord, error) {
+	if !offloadCandidate(f) {
+		return false, f, nil
 	}
 	if store == nil || !store.Enabled() {
-		return false, f
+		return false, f, fmt.Errorf("object storage disabled")
 	}
 	if f.DiskPath == "" {
-		return false, f
+		return false, f, fmt.Errorf("local file unavailable")
 	}
 	if _, err := os.Stat(f.DiskPath); err != nil {
-		return false, f
+		return false, f, err
 	}
 
 	key := store.ObjectKey(rec.InfoHash, f.Path)
 	if err := store.Upload(ctx, f.DiskPath, key); err != nil {
-		return false, f
+		return false, f, err
 	}
 
 	f.ObjectKey = key
 	f.RemoteStored = true
-	return true, f
+	return true, f, nil
 }
 
 func removeLocalOffloadedFile(f storage.TorrentFileRecord) {

@@ -82,9 +82,6 @@ func (l Lifecycle) LinksVisible(rec *storage.TorrentRecord) bool {
 	if rec == nil || IsFailedStatus(rec.Status) {
 		return false
 	}
-	if IsCompletedStatus(rec.Status) {
-		return true
-	}
 	for _, f := range rec.Files {
 		if l.FileLinksVisible(rec, f) {
 			return true
@@ -95,6 +92,9 @@ func (l Lifecycle) LinksVisible(rec *storage.TorrentRecord) bool {
 
 func (l Lifecycle) FileLinksVisible(rec *storage.TorrentRecord, f storage.TorrentFileRecord) bool {
 	if rec == nil || !f.Selected || IsFailedStatus(rec.Status) {
+		return false
+	}
+	if !isVideoPath(f.Path) {
 		return false
 	}
 	if IsCompletedStatus(rec.Status) {

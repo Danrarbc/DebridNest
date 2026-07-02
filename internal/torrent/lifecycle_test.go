@@ -183,6 +183,12 @@ func TestLifecycleIgnoresNonVideoPrefixBytes(t *testing.T) {
 	if view.Streamable || view.LinksVisible {
 		t.Fatalf("view = %+v, want non-video file not streamable", view)
 	}
+
+	rec.Status = string(StatusDownloaded)
+	view = NewLifecycle(16).View(rec)
+	if view.LinksVisible {
+		t.Fatalf("view = %+v, want completed non-video file links hidden", view)
+	}
 }
 
 func TestLifecycleFileLinksVisible(t *testing.T) {
@@ -192,6 +198,7 @@ func TestLifecycleFileLinksVisible(t *testing.T) {
 		Files: []storage.TorrentFileRecord{
 			{ID: 1, Selected: true, Path: "/ready.mkv", Bytes: 100, StreamableBytes: 32},
 			{ID: 2, Selected: true, Path: "/later.mkv", Bytes: 100, StreamableBytes: 8},
+			{ID: 3, Selected: true, Path: "/payload.scr", Bytes: 100, StreamableBytes: 100},
 		},
 	}
 
@@ -201,10 +208,16 @@ func TestLifecycleFileLinksVisible(t *testing.T) {
 	if l.FileLinksVisible(rec, rec.Files[1]) {
 		t.Fatal("unready selected video file should not expose links")
 	}
+	if l.FileLinksVisible(rec, rec.Files[2]) {
+		t.Fatal("selected non-video file should not expose links")
+	}
 
 	rec.Status = string(StatusDownloaded)
 	if !l.FileLinksVisible(rec, rec.Files[1]) {
-		t.Fatal("completed selected file should expose links")
+		t.Fatal("completed selected video file should expose links")
+	}
+	if l.FileLinksVisible(rec, rec.Files[2]) {
+		t.Fatal("completed selected non-video file should not expose links")
 	}
 
 	rec.Status = string(StatusMagnetError)

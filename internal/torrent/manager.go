@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/metainfo"
 	tstorage "github.com/anacrolix/torrent/storage"
+	"github.com/debridnest/debridnest/internal/auth"
 	"github.com/debridnest/debridnest/internal/config"
 	"github.com/debridnest/debridnest/internal/diskusage"
 	"github.com/debridnest/debridnest/internal/links"
@@ -48,10 +50,53 @@ type Manager struct {
 
 type Hooks struct {
 	OnDownloadComplete func(name string)
+	OnTorrentProblem   func(problem TorrentProblem)
+}
+
+type TorrentProblem struct {
+	ID     string
+	Name   string
+	Status string
 }
 
 var ErrInvalidMagnet = errors.New("invalid magnet")
 var ErrObjectStorageQuotaExceeded = errors.New("S3 object storage quota exceeded")
+var ErrAccessDenied = errors.New("access denied")
+var ErrUserQuotaExceeded = errors.New("user quota exceeded")
+var ErrTorrentFileNotFound = errors.New("torrent file not found")
+
+func ownerFromContext(ctx context.Context) (id, name string) {
+	user, ok := auth.UserFromContext(ctx)
+	if !ok {
+		return "", ""
+	}
+	return user.ID, user.Name
+}
+
+func userCanAccessRecord(ctx context.Context, rec *storage.TorrentRecord) bool {
+	if rec == nil || rec.OwnerID == "" {
+		return true
+	}
+	user, ok := auth.UserFromContext(ctx)
+	if !ok || user.Admin {
+		return true
+	}
+	return user.ID == rec.OwnerID
+}
+
+func filterVisibleRecords(ctx context.Context, items []storage.TorrentRecord) []storage.TorrentRecord {
+	user, ok := auth.UserFromContext(ctx)
+	if !ok || user.Admin {
+		return items
+	}
+	out := items[:0]
+	for i := range items {
+		if items[i].OwnerID == "" || items[i].OwnerID == user.ID {
+			out = append(out, items[i])
+		}
+	}
+	return out
+}
 
 func (m *Manager) SetHooks(h *Hooks) {
 	m.mu.Lock()
@@ -65,6 +110,15 @@ func (m *Manager) fireDownloadComplete(name string) {
 	m.mu.RUnlock()
 	if hooks != nil && hooks.OnDownloadComplete != nil {
 		hooks.OnDownloadComplete(name)
+	}
+}
+
+func (m *Manager) fireTorrentProblem(problem TorrentProblem) {
+	m.mu.RLock()
+	hooks := m.hooks
+	m.mu.RUnlock()
+	if hooks != nil && hooks.OnTorrentProblem != nil {
+		hooks.OnTorrentProblem(problem)
 	}
 }
 
@@ -153,6 +207,9 @@ func (m *Manager) AddMagnet(ctx context.Context, magnet string) (*storage.Torren
 	}
 
 	if existing, err := m.db.GetTorrentByHash(ctx, ih); err == nil && existing != nil {
+		if !userCanAccessRecord(ctx, existing) {
+			return nil, ErrAccessDenied
+		}
 		m.refreshProgress(ctx, existing)
 		if existing.Status == string(StatusDownloaded) {
 			m.ensureHostLinks(ctx, existing)
@@ -182,13 +239,16 @@ func (m *Manager) AddMagnet(ctx context.Context, magnet string) (*storage.Torren
 		return nil, err
 	}
 
+	ownerID, ownerName := ownerFromContext(ctx)
 	rec := storage.TorrentRecord{
-		ID:       id,
-		InfoHash: ih,
-		Magnet:   magnet,
-		Status:   string(StatusMagnetConversion),
-		AddedAt:  time.Now().UTC(),
-		Progress: 0,
+		ID:        id,
+		InfoHash:  ih,
+		Magnet:    magnet,
+		Status:    string(StatusMagnetConversion),
+		AddedAt:   time.Now().UTC(),
+		Progress:  0,
+		OwnerID:   ownerID,
+		OwnerName: ownerName,
 	}
 
 	if err := m.db.CreateTorrent(ctx, rec); err != nil {
@@ -204,8 +264,14 @@ func (m *Manager) SelectFiles(ctx context.Context, torrentID, filesSpec string) 
 	if err != nil {
 		return err
 	}
+	if !userCanAccessRecord(ctx, rec) {
+		return ErrAccessDenied
+	}
 
 	if err := m.lifecycle.ApplySelection(rec, filesSpec); err != nil {
+		return err
+	}
+	if err := m.ensureUserQuotaForSelection(ctx, rec); err != nil {
 		return err
 	}
 	if m.currentS3Config().Enabled && m.objectStorageQuotaBytes() > 0 {
@@ -243,6 +309,9 @@ func (m *Manager) Delete(ctx context.Context, torrentID string) error {
 	if err != nil {
 		return err
 	}
+	if !userCanAccessRecord(ctx, rec) {
+		return ErrAccessDenied
+	}
 
 	m.stopTorrent(torrentID, rec.InfoHash, rec.Magnet)
 	m.removeTorrentData(ctx, rec)
@@ -269,6 +338,9 @@ func (m *Manager) Get(ctx context.Context, torrentID string) (*storage.TorrentRe
 	if err != nil {
 		return nil, err
 	}
+	if !userCanAccessRecord(ctx, rec) {
+		return nil, ErrAccessDenied
+	}
 	m.refreshProgress(ctx, rec)
 	return rec, nil
 }
@@ -281,7 +353,32 @@ func (m *Manager) List(ctx context.Context, limit int) ([]storage.TorrentRecord,
 	for i := range items {
 		m.refreshProgress(ctx, &items[i])
 	}
-	return items, nil
+	return filterVisibleRecords(ctx, items), nil
+}
+
+func (m *Manager) ListLibrary(ctx context.Context, limit int) ([]storage.TorrentRecord, error) {
+	items, err := m.db.ListCompletedTorrents(ctx, limit)
+	if err != nil {
+		return nil, err
+	}
+	for i := range items {
+		m.refreshStreamLinks(ctx, &items[i])
+	}
+	return filterVisibleRecords(ctx, items), nil
+}
+
+func (m *Manager) SetLibraryState(ctx context.Context, torrentID string, state storage.TorrentLibraryState) (*storage.TorrentRecord, error) {
+	rec, err := m.db.GetTorrent(ctx, torrentID)
+	if err != nil {
+		return nil, err
+	}
+	if !userCanAccessRecord(ctx, rec) {
+		return nil, ErrAccessDenied
+	}
+	if err := m.db.SetTorrentLibraryState(ctx, torrentID, state); err != nil {
+		return nil, err
+	}
+	return m.Get(ctx, torrentID)
 }
 
 func (m *Manager) Unrestrict(ctx context.Context, hostLink string) (*storage.DownloadRecord, error) {
@@ -339,6 +436,8 @@ func (m *Manager) Unrestrict(ctx context.Context, hostLink string) (*storage.Dow
 		HostLink:    hostLink,
 		DownloadURL: downloadURL,
 		GeneratedAt: time.Now().UTC(),
+		OwnerID:     rec.OwnerID,
+		OwnerName:   rec.OwnerName,
 	}
 	if err := m.db.SaveDownload(ctx, dl); err != nil {
 		return nil, err
@@ -347,7 +446,45 @@ func (m *Manager) Unrestrict(ctx context.Context, hostLink string) (*storage.Dow
 }
 
 func (m *Manager) ListDownloads(ctx context.Context, limit int) ([]storage.DownloadRecord, error) {
-	return m.db.ListDownloads(ctx, limit)
+	items, err := m.db.ListDownloads(ctx, limit)
+	if err != nil {
+		return nil, err
+	}
+	user, ok := auth.UserFromContext(ctx)
+	if !ok || user.Admin {
+		return items, nil
+	}
+	out := items[:0]
+	for i := range items {
+		if items[i].OwnerID == "" || items[i].OwnerID == user.ID {
+			out = append(out, items[i])
+		}
+	}
+	return out, nil
+}
+
+func (m *Manager) CreateShareLink(ctx context.Context, rec storage.ShareLinkRecord) error {
+	return m.db.CreateShareLink(ctx, rec)
+}
+
+func (m *Manager) GetShareLinkByTokenHash(ctx context.Context, tokenHash string) (storage.ShareLinkRecord, error) {
+	return m.db.GetShareLinkByTokenHash(ctx, tokenHash)
+}
+
+func (m *Manager) GetShareLinkByID(ctx context.Context, id string) (storage.ShareLinkRecord, error) {
+	return m.db.GetShareLinkByID(ctx, id)
+}
+
+func (m *Manager) ListShareLinks(ctx context.Context, ownerID string, includeAll bool, limit int) ([]storage.ShareLinkRecord, error) {
+	return m.db.ListShareLinks(ctx, ownerID, includeAll, limit)
+}
+
+func (m *Manager) MarkShareLinkAccessed(ctx context.Context, id string, at time.Time) error {
+	return m.db.MarkShareLinkAccessed(ctx, id, at)
+}
+
+func (m *Manager) RevokeShareLink(ctx context.Context, id string, at time.Time) error {
+	return m.db.RevokeShareLink(ctx, id, at)
 }
 
 // InstantAvailability returns Real-Debrid-compatible cache map for hashes already downloaded locally.
@@ -374,7 +511,7 @@ func (m *Manager) InstantAvailability(ctx context.Context, hashes []string) map[
 
 	for _, hash := range normalized {
 		rec, ok := byHash[hash]
-		if !ok || !m.lifecycle.LinksVisible(rec) {
+		if !ok || !userCanAccessRecord(ctx, rec) || !m.lifecycle.LinksVisible(rec) {
 			continue
 		}
 		m.ensureHostLinks(ctx, rec)
@@ -922,10 +1059,14 @@ func (m *Manager) replaceTorrentFiles(ctx context.Context, torrentID string, fil
 		if f.RemoteStored {
 			remoteStored = 1
 		}
+		keepLocal := 0
+		if f.KeepLocal {
+			keepLocal = 1
+		}
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO torrent_files (id, torrent_id, path, bytes, selected, downloaded_bytes, streamable_bytes, disk_path, object_key, remote_stored)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			f.ID, torrentID, f.Path, f.Bytes, selected, f.DownloadedBytes, f.StreamableBytes, f.DiskPath, f.ObjectKey, remoteStored,
+			INSERT INTO torrent_files (id, torrent_id, path, bytes, selected, downloaded_bytes, streamable_bytes, disk_path, object_key, remote_stored, keep_local)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			f.ID, torrentID, f.Path, f.Bytes, selected, f.DownloadedBytes, f.StreamableBytes, f.DiskPath, f.ObjectKey, remoteStored, keepLocal,
 		); err != nil {
 			return err
 		}
@@ -1049,8 +1190,34 @@ func (m *Manager) setError(ctx context.Context, id, status string) {
 	if err != nil {
 		return
 	}
+	prevStatus := rec.Status
 	rec.Status = status
-	_ = m.db.UpdateTorrent(ctx, *rec)
+	if err := m.db.UpdateTorrent(ctx, *rec); err != nil {
+		return
+	}
+	if !IsFailedStatus(prevStatus) && IsFailedStatus(status) {
+		m.fireTorrentProblem(TorrentProblem{
+			ID:     rec.ID,
+			Name:   torrentProblemName(rec),
+			Status: status,
+		})
+	}
+}
+
+func torrentProblemName(rec *storage.TorrentRecord) string {
+	if rec == nil {
+		return ""
+	}
+	if strings.TrimSpace(rec.Name) != "" {
+		return rec.Name
+	}
+	if strings.TrimSpace(rec.OriginalName) != "" {
+		return rec.OriginalName
+	}
+	if strings.TrimSpace(rec.InfoHash) != "" {
+		return rec.InfoHash
+	}
+	return rec.ID
 }
 
 func (m *Manager) selectedTotal(rec *storage.TorrentRecord) int64 {
@@ -1205,6 +1372,64 @@ func (m *Manager) objectStorageQuotaBytes() int64 {
 	return gb * 1024 * 1024 * 1024
 }
 
+func (m *Manager) ensureUserQuotaAvailable(ctx context.Context, ownerID, excludeTorrentID string, requiredBytes int64) error {
+	if requiredBytes <= 0 {
+		return nil
+	}
+	limits, ok, err := m.userLimits(ctx, ownerID)
+	if err != nil || !ok || limits.QuotaBytes <= 0 {
+		return err
+	}
+	if ownerID == "" {
+		if user, ok := auth.UserFromContext(ctx); ok {
+			ownerID = user.ID
+		}
+	}
+	if ownerID == "" {
+		return nil
+	}
+	used, err := m.db.UserSelectedBytes(ctx, ownerID, excludeTorrentID)
+	if err != nil {
+		return err
+	}
+	if used+requiredBytes > limits.QuotaBytes {
+		return ErrUserQuotaExceeded
+	}
+	return nil
+}
+
+func (m *Manager) ensureUserQuotaForSelection(ctx context.Context, rec *storage.TorrentRecord) error {
+	if rec == nil {
+		return nil
+	}
+	var required int64
+	for _, f := range rec.Files {
+		if f.Selected {
+			required += f.Bytes
+		}
+	}
+	return m.ensureUserQuotaAvailable(ctx, rec.OwnerID, rec.ID, required)
+}
+
+func (m *Manager) userLimits(ctx context.Context, ownerID string) (storage.UserLimits, bool, error) {
+	if user, ok := auth.UserFromContext(ctx); ok {
+		if ownerID == "" || ownerID == user.ID {
+			return storage.UserLimits{QuotaBytes: user.QuotaBytes, RateLimitMbps: user.RateLimitMbps}, true, nil
+		}
+	}
+	if ownerID == "" {
+		return storage.UserLimits{}, false, nil
+	}
+	limits, err := m.db.GetUserLimits(ctx, ownerID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return storage.UserLimits{}, false, nil
+	}
+	if err != nil {
+		return storage.UserLimits{}, false, err
+	}
+	return limits, true, nil
+}
+
 func (m *Manager) ensureObjectStorageQuotaAvailable(ctx context.Context, requiredBytes int64) error {
 	if !m.currentS3Config().Enabled {
 		return nil
@@ -1336,11 +1561,99 @@ func (m *Manager) ObjectStorageUsage(ctx context.Context) (storage.ObjectStorage
 	return m.db.ObjectStorageUsage(ctx)
 }
 
+func (m *Manager) ObjectStorageReservedUsage(ctx context.Context) (storage.ObjectStorageUsage, error) {
+	return m.db.ObjectStorageReservedUsage(ctx, "")
+}
+
 func (m *Manager) ObjectStorageQuotaBytes() int64 {
 	if !m.currentS3Config().Enabled {
 		return 0
 	}
 	return m.objectStorageQuotaBytes()
+}
+
+func (m *Manager) ObjectStorageRecords(ctx context.Context) ([]storage.ObjectStorageRecord, error) {
+	return m.db.ListObjectStorageRecords(ctx)
+}
+
+func (m *Manager) SetFileStoragePolicy(ctx context.Context, torrentID string, fileID int, keepLocal *bool, offloadOnly bool) (storage.TorrentFileRecord, error) {
+	rec, err := m.db.GetTorrent(ctx, torrentID)
+	if err != nil {
+		return storage.TorrentFileRecord{}, fmt.Errorf("unknown torrent")
+	}
+
+	idx := -1
+	for i := range rec.Files {
+		if rec.Files[i].ID == fileID {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return storage.TorrentFileRecord{}, ErrTorrentFileNotFound
+	}
+
+	if offloadOnly {
+		v := false
+		keepLocal = &v
+	}
+	if keepLocal != nil {
+		rec.Files[idx].KeepLocal = *keepLocal
+	}
+	if err := m.db.UpdateTorrentFiles(ctx, rec.ID, rec.Files); err != nil {
+		return storage.TorrentFileRecord{}, err
+	}
+
+	updated := rec.Files[idx]
+	if !offloadOnly {
+		return updated, nil
+	}
+	if updated.RemoteStored {
+		removeLocalOffloadedFile(updated)
+		m.invalidateDiskUsed()
+		return updated, nil
+	}
+	if !offloadCandidate(updated) {
+		return updated, nil
+	}
+
+	store, err := m.objectStoreForSettings()
+	if err != nil {
+		return updated, err
+	}
+	if store == nil || !store.Enabled() {
+		return updated, fmt.Errorf("object storage disabled")
+	}
+
+	quota := m.objectStorageQuotaBytes()
+	if quota > 0 {
+		m.objectQuotaMu.Lock()
+		defer m.objectQuotaMu.Unlock()
+		usage, err := m.db.ObjectStorageUsage(ctx)
+		if err != nil {
+			return updated, err
+		}
+		if usage.Bytes+updated.Bytes > quota {
+			return updated, ErrObjectStorageQuotaExceeded
+		}
+	}
+
+	changed, out, err := m.offloadOneFileStrict(ctx, store, rec, updated)
+	if err != nil {
+		return updated, err
+	}
+	if !changed {
+		return updated, nil
+	}
+
+	rec.Files = replaceTorrentFile(rec.Files, out)
+	if err := m.db.UpdateTorrentFiles(ctx, rec.ID, rec.Files); err != nil {
+		_ = store.Delete(ctx, out.ObjectKey)
+		return updated, err
+	}
+	removeLocalOffloadedFile(out)
+	m.invalidateDiskUsed()
+	return out, nil
 }
 
 func (m *Manager) DeleteCompletedBefore(ctx context.Context, before time.Time) (int, error) {
@@ -1514,6 +1827,9 @@ func (m *Manager) AddTorrentFile(ctx context.Context, data []byte) (*storage.Tor
 	magnet := mi.Magnet(nil, &info).String()
 
 	if existing, err := m.db.GetTorrentByHash(ctx, infoHash); err == nil && existing != nil {
+		if !userCanAccessRecord(ctx, existing) {
+			return nil, ErrAccessDenied
+		}
 		m.refreshProgress(ctx, existing)
 		if existing.Status == string(StatusDownloaded) {
 			m.ensureHostLinks(ctx, existing)
@@ -1523,6 +1839,9 @@ func (m *Manager) AddTorrentFile(ctx context.Context, data []byte) (*storage.Tor
 	requiredBytes := int64(0)
 	if len(info.UpvertedFiles()) <= 1 {
 		requiredBytes = info.TotalLength()
+	}
+	if err := m.ensureUserQuotaAvailable(ctx, "", "", requiredBytes); err != nil {
+		return nil, err
 	}
 	if m.currentS3Config().Enabled && m.objectStorageQuotaBytes() > 0 {
 		m.objectQuotaMu.Lock()
@@ -1542,6 +1861,7 @@ func (m *Manager) AddTorrentFile(ctx context.Context, data []byte) (*storage.Tor
 		return nil, err
 	}
 
+	ownerID, ownerName := ownerFromContext(ctx)
 	rec := storage.TorrentRecord{
 		ID:           id,
 		InfoHash:     infoHash,
@@ -1551,6 +1871,8 @@ func (m *Manager) AddTorrentFile(ctx context.Context, data []byte) (*storage.Tor
 		Status:       string(StatusMagnetConversion),
 		InfoBytes:    infoBuf.Bytes(),
 		AddedAt:      time.Now().UTC(),
+		OwnerID:      ownerID,
+		OwnerName:    ownerName,
 	}
 
 	if err := m.db.CreateTorrent(ctx, rec); err != nil {

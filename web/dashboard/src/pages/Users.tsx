@@ -13,7 +13,7 @@ import Modal from '../components/Modal';
 import { TopBarActions, TopBarMeta } from '../components/TopBar';
 import { useToast } from '../components/Toast';
 import { usePolling } from '../hooks/usePolling';
-import { formatRelativeTime } from '../lib/format';
+import { formatBytes, formatRelativeTime } from '../lib/format';
 
 function TokenModal({
   title,
@@ -52,6 +52,8 @@ function CreateUserModal({
   const { toast } = useToast();
   const [name, setName] = useState('');
   const [admin, setAdmin] = useState(false);
+  const [quotaGb, setQuotaGb] = useState('');
+  const [rateLimitMbps, setRateLimitMbps] = useState('');
   const [busy, setBusy] = useState(false);
 
   async function handleSubmit(e: FormEvent) {
@@ -64,7 +66,12 @@ function CreateUserModal({
 
     setBusy(true);
     try {
-      const result = await createUser({ name: trimmed, role: admin ? 'admin' : 'user' });
+      const result = await createUser({
+        name: trimmed,
+        role: admin ? 'admin' : 'user',
+        quotaGb: Number(quotaGb) || 0,
+        rateLimitMbps: Number(rateLimitMbps) || 0,
+      });
       onCreated(result);
     } catch (err) {
       toast(err instanceof Error ? err.message : 'Failed to create user', 'error');
@@ -91,6 +98,34 @@ function CreateUserModal({
           <input type="checkbox" checked={admin} onChange={(e) => setAdmin(e.target.checked)} />
           <span>Admin access</span>
         </label>
+        <div className="settings-grid" style={{ marginTop: 14 }}>
+          <div className="form-group">
+            <label htmlFor="user-quota">Quota (GB)</label>
+            <input
+              id="user-quota"
+              className="input"
+              type="number"
+              min="0"
+              step="0.1"
+              value={quotaGb}
+              onChange={(e) => setQuotaGb(e.target.value)}
+              placeholder="0"
+            />
+          </div>
+          <div className="form-group">
+            <label htmlFor="user-rate">Download cap (MB/s)</label>
+            <input
+              id="user-rate"
+              className="input"
+              type="number"
+              min="0"
+              step="0.1"
+              value={rateLimitMbps}
+              onChange={(e) => setRateLimitMbps(e.target.value)}
+              placeholder="0"
+            />
+          </div>
+        </div>
         <div className="modal-actions">
           <button type="button" className="btn btn-ghost" onClick={onClose}>
             Cancel
@@ -165,6 +200,15 @@ export default function Users() {
   }
 
   const list = users ?? [];
+  const usageLabel = (user: DashboardUser) => {
+    const used = user.usedBytes ?? 0;
+    const quota = user.quotaBytes ?? 0;
+    if (quota > 0) return `${formatBytes(used)} / ${formatBytes(quota)}`;
+    if (used > 0) return `${formatBytes(used)} used`;
+    return 'No quota';
+  };
+  const rateLabel = (user: DashboardUser) =>
+    user.rateLimitMbps && user.rateLimitMbps > 0 ? `${user.rateLimitMbps} MB/s` : 'Default';
 
   return (
     <div className="page">
@@ -193,6 +237,8 @@ export default function Users() {
               <tr>
                 <th>Name</th>
                 <th>Role</th>
+                <th>Quota</th>
+                <th>Cap</th>
                 <th>Created</th>
                 <th aria-label="Actions" />
               </tr>
@@ -207,6 +253,8 @@ export default function Users() {
                     )}
                   </td>
                   <td className="muted">{user.role}</td>
+                  <td className="muted">{usageLabel(user)}</td>
+                  <td className="muted">{rateLabel(user)}</td>
                   <td className="muted">
                     {user.createdAt ? formatRelativeTime(user.createdAt) : '—'}
                   </td>

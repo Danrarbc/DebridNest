@@ -1,7 +1,15 @@
 package objectstore
 
 import (
+	"context"
+	"io"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 func TestObjectKey(t *testing.T) {
@@ -153,4 +161,101 @@ func TestLoadFromEnvDirectRespectsExplicitOffloadLocalOff(t *testing.T) {
 	if cfg.OffloadLocal {
 		t.Fatal("expected OffloadLocal false when explicitly disabled")
 	}
+}
+
+func TestListObjectsUsesDelimiter(t *testing.T) {
+	modified := time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
+	client := &fakeS3Client{
+		listOutputs: []*s3.ListObjectsV2Output{
+			{
+				CommonPrefixes: []types.CommonPrefix{{Prefix: aws.String("nest/hash/")}},
+				Contents: []types.Object{
+					{Key: aws.String("nest/root.mkv"), Size: aws.Int64(123), LastModified: &modified},
+				},
+			},
+		},
+	}
+	store := &Store{cfg: Config{Enabled: true, Bucket: "bucket"}, client: client}
+
+	result, err := store.List(context.Background(), "/nest//", 50)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if client.listInputs[0].Prefix == nil || *client.listInputs[0].Prefix != "nest/" {
+		t.Fatalf("prefix = %v, want nest/", client.listInputs[0].Prefix)
+	}
+	if client.listInputs[0].Delimiter == nil || *client.listInputs[0].Delimiter != "/" {
+		t.Fatalf("delimiter = %v, want /", client.listInputs[0].Delimiter)
+	}
+	if len(result.Objects) != 2 {
+		t.Fatalf("objects = %d, want 2", len(result.Objects))
+	}
+	if !result.Objects[0].Directory || result.Objects[0].Key != "nest/hash/" {
+		t.Fatalf("directory object = %+v", result.Objects[0])
+	}
+	if result.Objects[1].Directory || result.Objects[1].Key != "nest/root.mkv" || result.Objects[1].Size != 123 {
+		t.Fatalf("file object = %+v", result.Objects[1])
+	}
+}
+
+func TestListAllObjectsPaginates(t *testing.T) {
+	client := &fakeS3Client{
+		listOutputs: []*s3.ListObjectsV2Output{
+			{
+				Contents:              []types.Object{{Key: aws.String("nest/a.mkv"), Size: aws.Int64(1)}},
+				IsTruncated:           aws.Bool(true),
+				NextContinuationToken: aws.String("next"),
+			},
+			{
+				Contents: []types.Object{{Key: aws.String("nest/b.mkv"), Size: aws.Int64(2)}},
+			},
+		},
+	}
+	store := &Store{cfg: Config{Enabled: true, Bucket: "bucket"}, client: client}
+
+	result, err := store.ListAll(context.Background(), "nest/", 100)
+	if err != nil {
+		t.Fatalf("list all: %v", err)
+	}
+	if len(result.Objects) != 2 {
+		t.Fatalf("objects = %d, want 2", len(result.Objects))
+	}
+	if client.listInputs[1].ContinuationToken == nil || *client.listInputs[1].ContinuationToken != "next" {
+		t.Fatalf("continuation token = %v, want next", client.listInputs[1].ContinuationToken)
+	}
+}
+
+type fakeS3Client struct {
+	listOutputs []*s3.ListObjectsV2Output
+	listInputs  []*s3.ListObjectsV2Input
+}
+
+func (f *fakeS3Client) HeadBucket(context.Context, *s3.HeadBucketInput, ...func(*s3.Options)) (*s3.HeadBucketOutput, error) {
+	return &s3.HeadBucketOutput{}, nil
+}
+
+func (f *fakeS3Client) ListObjectsV2(_ context.Context, in *s3.ListObjectsV2Input, _ ...func(*s3.Options)) (*s3.ListObjectsV2Output, error) {
+	f.listInputs = append(f.listInputs, in)
+	if len(f.listOutputs) == 0 {
+		return &s3.ListObjectsV2Output{}, nil
+	}
+	out := f.listOutputs[0]
+	f.listOutputs = f.listOutputs[1:]
+	return out, nil
+}
+
+func (f *fakeS3Client) PutObject(context.Context, *s3.PutObjectInput, ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
+	return &s3.PutObjectOutput{}, nil
+}
+
+func (f *fakeS3Client) DeleteObject(context.Context, *s3.DeleteObjectInput, ...func(*s3.Options)) (*s3.DeleteObjectOutput, error) {
+	return &s3.DeleteObjectOutput{}, nil
+}
+
+func (f *fakeS3Client) HeadObject(context.Context, *s3.HeadObjectInput, ...func(*s3.Options)) (*s3.HeadObjectOutput, error) {
+	return &s3.HeadObjectOutput{}, nil
+}
+
+func (f *fakeS3Client) GetObject(context.Context, *s3.GetObjectInput, ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
+	return &s3.GetObjectOutput{Body: io.NopCloser(strings.NewReader(""))}, nil
 }

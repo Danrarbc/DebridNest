@@ -271,6 +271,41 @@ func TestOpenServingReaderRejectsRangePastStreamablePrefixWithoutRuntime(t *test
 	}
 }
 
+func TestOpenServingReaderRejectsCompletedNonVideoFile(t *testing.T) {
+	manager, db := testManager(t)
+	ctx := context.Background()
+	hash := "dddddddddddddddddddddddddddddddddddddddd"
+	diskPath := filepath.Join(manager.filesDir, hash, "payload.scr")
+	if err := os.MkdirAll(filepath.Dir(diskPath), 0o755); err != nil {
+		t.Fatalf("create torrent dir: %v", err)
+	}
+	if err := os.WriteFile(diskPath, []byte("not a video"), 0o644); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+
+	ended := time.Now().UTC()
+	rec := storage.TorrentRecord{
+		ID:       "SCR00001",
+		InfoHash: hash,
+		Magnet:   "magnet:?xt=urn:btih:" + hash,
+		Status:   string(StatusDownloaded),
+		Progress: 100,
+		AddedAt:  ended.Add(-time.Minute),
+		EndedAt:  &ended,
+		Files: []storage.TorrentFileRecord{
+			{ID: 1, Path: "/payload.scr", Bytes: int64(len("not a video")), Selected: true, DownloadedBytes: int64(len("not a video")), StreamableBytes: int64(len("not a video")), DiskPath: diskPath},
+		},
+	}
+	if err := db.CreateTorrent(ctx, rec); err != nil {
+		t.Fatalf("create torrent: %v", err)
+	}
+
+	_, _, _, err := manager.OpenServingReader(ctx, rec.ID, 1, StreamOptions{})
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("OpenServingReader non-video error = %v, want os.ErrNotExist", err)
+	}
+}
+
 func TestObjectStoreRefreshesFromRuntimeS3Settings(t *testing.T) {
 	manager, _ := testManager(t)
 	ctx := context.Background()
@@ -410,6 +445,39 @@ func TestReconcileStaleMagnetConversionMarksOldInactiveRowsError(t *testing.T) {
 	}
 	if updated.Status != "magnet_error" {
 		t.Fatalf("status = %q, want magnet_error", updated.Status)
+	}
+}
+
+func TestSetErrorFiresTorrentProblemHookOnce(t *testing.T) {
+	manager, db := testManager(t)
+	ctx := context.Background()
+	rec := storage.TorrentRecord{
+		ID:       "FAILHOOK",
+		InfoHash: "5555555555555555555555555555555555555555",
+		Magnet:   "magnet:?xt=urn:btih:5555555555555555555555555555555555555555",
+		Name:     "stalled movie",
+		Status:   string(StatusDownloading),
+		AddedAt:  time.Now().UTC(),
+	}
+	if err := db.CreateTorrent(ctx, rec); err != nil {
+		t.Fatalf("create torrent: %v", err)
+	}
+
+	var problems []TorrentProblem
+	manager.SetHooks(&Hooks{
+		OnTorrentProblem: func(problem TorrentProblem) {
+			problems = append(problems, problem)
+		},
+	})
+
+	manager.setError(ctx, rec.ID, string(StatusMagnetError))
+	manager.setError(ctx, rec.ID, string(StatusMagnetError))
+
+	if len(problems) != 1 {
+		t.Fatalf("problem hook calls = %d, want 1", len(problems))
+	}
+	if problems[0].ID != rec.ID || problems[0].Name != rec.Name || problems[0].Status != string(StatusMagnetError) {
+		t.Fatalf("problem = %+v, want id/name/status from torrent", problems[0])
 	}
 }
 
@@ -752,5 +820,82 @@ func TestStatsHideObjectStorageQuotaWhenS3Disabled(t *testing.T) {
 	}
 	if stats.S3Quota != 0 {
 		t.Fatalf("S3 quota = %d, want 0 when disabled", stats.S3Quota)
+	}
+}
+
+func TestSetFileStoragePolicyUpdatesKeepLocal(t *testing.T) {
+	manager, db := testManager(t)
+	ctx := context.Background()
+	rec := storage.TorrentRecord{
+		ID:       "POLICY_KEEP",
+		InfoHash: "1231231231231231231231231231231231231231",
+		Status:   string(StatusDownloaded),
+		AddedAt:  time.Now().UTC(),
+		Files: []storage.TorrentFileRecord{
+			{ID: 1, TorrentID: "POLICY_KEEP", Path: "/movie.mkv", Bytes: 100, Selected: true},
+		},
+	}
+	if err := db.CreateTorrent(ctx, rec); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	keep := true
+	file, err := manager.SetFileStoragePolicy(ctx, rec.ID, 1, &keep, false)
+	if err != nil {
+		t.Fatalf("set policy: %v", err)
+	}
+	if !file.KeepLocal {
+		t.Fatal("returned file keep_local = false, want true")
+	}
+
+	got, err := db.GetTorrent(ctx, rec.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !got.Files[0].KeepLocal {
+		t.Fatal("stored keep_local = false, want true")
+	}
+}
+
+func TestSetFileStoragePolicyOffloadOnlyRemovesRemoteLocalFile(t *testing.T) {
+	manager, db := testManager(t)
+	ctx := context.Background()
+	localPath := filepath.Join(t.TempDir(), "movie.mkv")
+	if err := os.WriteFile(localPath, []byte("data"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	rec := storage.TorrentRecord{
+		ID:       "POLICY_OFFLOAD",
+		InfoHash: "4564564564564564564564564564564564564564",
+		Status:   string(StatusDownloaded),
+		AddedAt:  time.Now().UTC(),
+		Files: []storage.TorrentFileRecord{
+			{
+				ID:           1,
+				TorrentID:    "POLICY_OFFLOAD",
+				Path:         "/movie.mkv",
+				Bytes:        4,
+				Selected:     true,
+				DiskPath:     localPath,
+				ObjectKey:    "remote/movie.mkv",
+				RemoteStored: true,
+				KeepLocal:    true,
+			},
+		},
+	}
+	if err := db.CreateTorrent(ctx, rec); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	file, err := manager.SetFileStoragePolicy(ctx, rec.ID, 1, nil, true)
+	if err != nil {
+		t.Fatalf("set policy: %v", err)
+	}
+	if file.KeepLocal {
+		t.Fatal("offload-only should clear keep_local")
+	}
+	if _, err := os.Stat(localPath); !os.IsNotExist(err) {
+		t.Fatalf("local file exists or unexpected error: %v", err)
 	}
 }

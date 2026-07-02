@@ -13,11 +13,36 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
+
+type s3Client interface {
+	HeadBucket(context.Context, *s3.HeadBucketInput, ...func(*s3.Options)) (*s3.HeadBucketOutput, error)
+	ListObjectsV2(context.Context, *s3.ListObjectsV2Input, ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
+	PutObject(context.Context, *s3.PutObjectInput, ...func(*s3.Options)) (*s3.PutObjectOutput, error)
+	DeleteObject(context.Context, *s3.DeleteObjectInput, ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
+	HeadObject(context.Context, *s3.HeadObjectInput, ...func(*s3.Options)) (*s3.HeadObjectOutput, error)
+	GetObject(context.Context, *s3.GetObjectInput, ...func(*s3.Options)) (*s3.GetObjectOutput, error)
+}
 
 type Store struct {
 	cfg    Config
-	client *s3.Client
+	client s3Client
+}
+
+type ObjectInfo struct {
+	Key          string
+	Size         int64
+	LastModified time.Time
+	Directory    bool
+}
+
+type ListResult struct {
+	Prefix      string
+	Objects     []ObjectInfo
+	Truncated   bool
+	NextToken   string
+	ScannedKeys int
 }
 
 func New(cfg Config) (*Store, error) {
@@ -61,6 +86,20 @@ func (s *Store) OffloadLocal() bool {
 
 func (s *Store) EarlyOffload() bool {
 	return s != nil && s.cfg.EarlyOffload
+}
+
+func (s *Store) Bucket() string {
+	if s == nil {
+		return ""
+	}
+	return s.cfg.Bucket
+}
+
+func (s *Store) Prefix() string {
+	if s == nil {
+		return ""
+	}
+	return s.cfg.Prefix
 }
 
 // TestConnection verifies bucket access via HeadBucket, falling back to ListObjectsV2.
@@ -154,6 +193,114 @@ func (s *Store) Head(ctx context.Context, key string) (size int64, modTime time.
 		modTime = *out.LastModified
 	}
 	return size, modTime, nil
+}
+
+func (s *Store) List(ctx context.Context, prefix string, limit int32) (ListResult, error) {
+	if !s.Enabled() {
+		return ListResult{}, fmt.Errorf("object store disabled")
+	}
+	prefix = cleanPrefix(prefix)
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+
+	out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket:    aws.String(s.cfg.Bucket),
+		Prefix:    aws.String(prefix),
+		Delimiter: aws.String("/"),
+		MaxKeys:   aws.Int32(limit),
+	})
+	if err != nil {
+		return ListResult{}, err
+	}
+
+	result := ListResult{Prefix: prefix}
+	for _, p := range out.CommonPrefixes {
+		if p.Prefix == nil {
+			continue
+		}
+		result.Objects = append(result.Objects, ObjectInfo{
+			Key:       *p.Prefix,
+			Directory: true,
+		})
+	}
+	for _, obj := range out.Contents {
+		key := aws.ToString(obj.Key)
+		if key == "" {
+			continue
+		}
+		result.Objects = append(result.Objects, objectInfoFromS3Object(obj))
+	}
+	result.Truncated = aws.ToBool(out.IsTruncated)
+	result.NextToken = aws.ToString(out.NextContinuationToken)
+	result.ScannedKeys = len(result.Objects)
+	return result, nil
+}
+
+func (s *Store) ListAll(ctx context.Context, prefix string, maxKeys int) (ListResult, error) {
+	if !s.Enabled() {
+		return ListResult{}, fmt.Errorf("object store disabled")
+	}
+	prefix = cleanPrefix(prefix)
+	if maxKeys <= 0 {
+		maxKeys = 10000
+	}
+
+	result := ListResult{Prefix: prefix}
+	var token *string
+	for {
+		out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(s.cfg.Bucket),
+			Prefix:            aws.String(prefix),
+			MaxKeys:           aws.Int32(1000),
+			ContinuationToken: token,
+		})
+		if err != nil {
+			return ListResult{}, err
+		}
+		for _, obj := range out.Contents {
+			key := aws.ToString(obj.Key)
+			if key == "" {
+				continue
+			}
+			result.Objects = append(result.Objects, objectInfoFromS3Object(obj))
+			if len(result.Objects) >= maxKeys {
+				result.Truncated = true
+				result.NextToken = aws.ToString(out.NextContinuationToken)
+				result.ScannedKeys = len(result.Objects)
+				return result, nil
+			}
+		}
+		result.Truncated = aws.ToBool(out.IsTruncated)
+		result.NextToken = aws.ToString(out.NextContinuationToken)
+		if !result.Truncated || out.NextContinuationToken == nil {
+			break
+		}
+		token = out.NextContinuationToken
+	}
+	result.ScannedKeys = len(result.Objects)
+	return result, nil
+}
+
+func cleanPrefix(prefix string) string {
+	prefix = strings.ReplaceAll(prefix, "\\", "/")
+	prefix = filepath.ToSlash(prefix)
+	prefix = strings.TrimLeft(prefix, "/")
+	for strings.Contains(prefix, "//") {
+		prefix = strings.ReplaceAll(prefix, "//", "/")
+	}
+	return prefix
+}
+
+func objectInfoFromS3Object(obj types.Object) ObjectInfo {
+	info := ObjectInfo{
+		Key:  aws.ToString(obj.Key),
+		Size: aws.ToInt64(obj.Size),
+	}
+	if obj.LastModified != nil {
+		info.LastModified = *obj.LastModified
+	}
+	return info
 }
 
 func (s *Store) Open(ctx context.Context, key string) (io.ReadSeekCloser, error) {

@@ -4,13 +4,58 @@ const seasonPacks = require('./seasonPacks')
 const VIDEO_EXT = /\.(mp4|mkv|avi|webm|mov|m4v|wmv|flv|ts|m2ts)$/i
 
 function parseSource(title) {
-  const t = title.toLowerCase()
+  const t = String(title || '').toLowerCase()
   if (/remux/u.test(t)) return 'Remux'
   if (/blu-?ray|bdrip|brrip/u.test(t)) return 'BluRay'
   if (/web-?dl/u.test(t)) return 'WEB-DL'
   if (/webrip/u.test(t)) return 'WEBRip'
   if (/hdtv/u.test(t)) return 'HDTV'
   return 'Unknown'
+}
+
+function splitFilterList(value) {
+  if (value === undefined || value === null || value === '') {
+    return []
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => splitFilterList(item))
+  }
+  return String(value)
+    .split(/[;,|]/u)
+    .map((part) => part.trim())
+    .filter(Boolean)
+}
+
+function normalizeSourceLabel(value) {
+  const normalized = String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '')
+  if (!normalized || normalized === 'any' || normalized === 'all') {
+    return null
+  }
+  if (normalized === 'remux') return 'Remux'
+  if (['bluray', 'blu', 'bdrip', 'brrip', 'bd'].includes(normalized)) return 'BluRay'
+  if (['webdl', 'webdownload'].includes(normalized)) return 'WEB-DL'
+  if (['webrip', 'web'].includes(normalized)) return 'WEBRip'
+  if (normalized === 'hdtv') return 'HDTV'
+  if (normalized === 'unknown' || normalized === 'other') return 'Unknown'
+  return null
+}
+
+function parseSourceFilter(value) {
+  const labels = []
+  for (const item of splitFilterList(value)) {
+    const label = normalizeSourceLabel(item)
+    if (label && !labels.includes(label)) {
+      labels.push(label)
+    }
+  }
+  return labels
+}
+
+function passesSourceFilter(source, sourceFilter) {
+  const allowed = parseSourceFilter(sourceFilter)
+  return !allowed.length || allowed.includes(source)
 }
 
 function matchesEpisode(title, meta) {
@@ -46,7 +91,7 @@ function looksLikeVideoRelease(title) {
   if (VIDEO_EXT.test(t) || /\.(mp4|mkv|avi|webm|mov|m4v)/i.test(t)) {
     return true
   }
-  return /2160p|4k|1080p|720p|480p|bluray|web-?dl|webrip|hdtv|remux|x264|x265|hevc|dvdrip/u.test(t)
+  return /2160p|4k|1080p|720p|480p|bluray|web-?dl|webrip|hdtv|sdtv|pdtv|remux|x264|x265|xvid|divx|hevc|dvdrip/u.test(t)
 }
 
 const TITLE_STOPWORDS = new Set([
@@ -115,9 +160,14 @@ function matchesMovieTitle(title, meta) {
 function torrentRejectionReason(torrent, meta, qualityConfig = {}) {
   const isSeasonPack = torrent.seasonPack
     || seasonPacks.isSeasonPackForMeta(torrent.title, meta)
+  const source = parseSource(torrent.title)
 
   if (!quality.passesQualityFilters(torrent, qualityConfig)) {
     return 'quality'
+  }
+
+  if (!passesSourceFilter(source, qualityConfig.sourceFilter)) {
+    return 'source'
   }
 
   if (!isSeasonPack && !looksLikeVideoRelease(torrent.title)) {
@@ -185,6 +235,7 @@ function rankTorrentsDetailed(torrents, meta, maxResults = 5, qualityConfig = {}
   const input = Array.isArray(torrents) ? torrents : []
   const rejected = {
     quality: 0,
+    source: 0,
     notVideo: 0,
     episodeMismatch: 0,
     movieTitleMismatch: 0,
@@ -253,6 +304,9 @@ function formatDisplayTitle(title) {
 function formatStreamMetadata(entry) {
   const { torrent } = entry
   const parts = [`Seeders: ${Number(torrent.seeders || 0)}`]
+  if (Number(torrent.leechers || 0) > 0) {
+    parts.push(`Leechers: ${Number(torrent.leechers || 0)}`)
+  }
   const sizeLabel = formatFileSize(torrent.size)
   if (sizeLabel) {
     parts.push(`Size: ${sizeLabel}`)
@@ -264,16 +318,67 @@ function formatStreamMetadata(entry) {
   return parts.join(' | ')
 }
 
+function normalizeStreamOptions(options = {}) {
+  if (typeof options === 'boolean') {
+    return { cached: options }
+  }
+  return {
+    cached: !!options.cached,
+    showHealth: !!options.showHealth,
+    debridStatus: options.debridStatus || '',
+  }
+}
+
+function formatReadinessLabel(options = {}) {
+  const { cached, debridStatus } = normalizeStreamOptions(options)
+  if (cached) {
+    return 'Ready now'
+  }
+  if (debridStatus === 'downloading') {
+    return 'Downloading now'
+  }
+  return 'Starts download'
+}
+
+function streamHealth(entry) {
+  const seeders = Number(entry?.torrent?.seeders || 0)
+  const leechers = Number(entry?.torrent?.leechers || 0)
+  let label = 'unknown'
+  if (seeders >= 100) {
+    label = 'excellent'
+  } else if (seeders >= 30) {
+    label = 'healthy'
+  } else if (seeders >= 5) {
+    label = 'fair'
+  } else if (seeders > 0) {
+    label = 'low'
+  }
+  return {
+    label,
+    seeders,
+    leechers,
+  }
+}
+
+function formatHealthLabel(entry) {
+  const health = streamHealth(entry)
+  const peers = [`${health.seeders} seeders`]
+  if (health.leechers > 0) {
+    peers.push(`${health.leechers} leechers`)
+  }
+  return `${health.label} (${peers.join(', ')})`
+}
+
 function formatStreamName(entry, cached = false) {
   const tags = quality.formatQualityTags(entry.torrent.title, entry.source)
-  const prefix = cached ? 'Ready' : 'Starts download'
+  const prefix = formatReadinessLabel(cached)
   return [prefix, tags].filter(Boolean).join('\n')
 }
 
 function formatStreamDisplay(entry, options = {}) {
-  const { cached = false } = options
+  const streamOptions = normalizeStreamOptions(options)
   return {
-    name: formatStreamName(entry, cached),
+    name: formatStreamName(entry, streamOptions),
     title: formatDisplayTitle(entry.torrent.title),
     description: formatStreamMetadata(entry),
   }
@@ -341,6 +446,20 @@ function compareFreshPlaceholderPriority(a, b) {
   return b.score - a.score
 }
 
+function compareReadyPriority(a, b) {
+  const scoreDelta = b.score - a.score
+  if (scoreDelta !== 0) {
+    return scoreDelta
+  }
+
+  const seedersDelta = Number(b.torrent.seeders || 0) - Number(a.torrent.seeders || 0)
+  if (seedersDelta !== 0) {
+    return seedersDelta
+  }
+
+  return compareKnownLowerSize(a, b)
+}
+
 function applyStreamListingPriority(ranked, availability) {
   return ranked.slice().sort((a, b) => {
     const aCached = isEntryCached(a, availability)
@@ -351,7 +470,7 @@ function applyStreamListingPriority(ranked, availability) {
     if (!aCached && !bCached) {
       return compareFreshPlaceholderPriority(a, b)
     }
-    return b.score - a.score
+    return compareReadyPriority(a, b)
   })
 }
 
@@ -373,33 +492,77 @@ function formatStreamFilename(title) {
   if (match) {
     return match[0]
   }
-  return cleaned.slice(0, 120) || 'video.mkv'
+  const base = cleaned.slice(0, 120) || 'video'
+  return /\.(mkv|mp4|avi|webm|mov|m4v|ts|m2ts)$/i.test(base) ? base : `${base}.mkv`
 }
 
-function formatBingeGroup(entry) {
-  const tags = quality.formatQualityTags(entry.torrent.title, entry.source)
-  const normalized = String(tags || entry.source || 'unknown')
-    .toLowerCase()
-    .replace(/\s+/g, '-')
-  return `debridnest|${normalized}`
+function formatStreamQualityLine(entry) {
+  return quality.parseQuality(entry?.torrent?.title).label || 'Stream'
 }
 
-function formatStremioStreamName(entry, cached = false) {
-  const tags = quality.formatQualityTags(entry.torrent.title, entry.source)
-  const qualityLabel = tags || entry.source || 'Stream'
-  const prefix = cached ? 'Ready' : 'Starts download'
-  const provider = formatProviderName(entry.torrent.indexer)
-  const parts = [prefix, qualityLabel]
-  if (provider) {
-    parts.push(provider)
+function parseCodecTag(title) {
+  const text = String(title || '')
+  if (/hevc|x265|h265/i.test(text)) {
+    return 'hevc'
   }
-  return ['DebridNest', ...parts].join('\n')
+  if (/x264|h264|avc/i.test(text)) {
+    return 'x264'
+  }
+  if (/hdrip/i.test(text)) {
+    return 'HDRip'
+  }
+  return null
 }
 
-function formatStremioStreamDescription(entry, cached = false) {
-  const display = formatStreamDisplay(entry, { cached })
-  const status = cached ? 'Status: ready' : 'Status: starts download'
-  return [display.title, status, display.description].filter(Boolean).join('\n')
+function formatBingeGroup(entry, options = {}) {
+  const qualityLine = formatStreamQualityLine(entry).toLowerCase()
+  const parts = ['debridnest', qualityLine]
+  const codec = parseCodecTag(entry?.torrent?.title)
+  if (codec) {
+    parts.push(codec.toLowerCase())
+  }
+  return parts.join('|')
+}
+
+function formatStremioStreamName(entry, options = {}) {
+  const streamOptions = normalizeStreamOptions(options)
+  const qualityLine = formatStreamQualityLine(entry)
+  const badge = streamOptions.cached ? '[DN+] ' : '[DN download] '
+  return `${badge}DebridNest\n${qualityLine}`
+}
+
+function formatStremioStreamTitle(entry, options = {}) {
+  const { torrent } = entry
+  const titleLine = formatDisplayTitle(torrent.title)
+  const seeders = Number(torrent.seeders || 0)
+  const sizeLabel = formatFileSize(torrent.size) || '?'
+  const provider = formatProviderName(torrent.indexer) || 'Unknown'
+  return `${titleLine}\n👤 ${seeders} 💾 ${sizeLabel} ⚙️ ${provider}`
+}
+
+function formatStatusDescription(options = {}) {
+  const streamOptions = normalizeStreamOptions(options)
+  if (streamOptions.cached) {
+    return 'Status: ready now via DebridNest instant availability'
+  }
+  if (streamOptions.debridStatus) {
+    return `Status: starts download (${streamOptions.debridStatus})`
+  }
+  return 'Status: starts download when selected'
+}
+
+function formatStremioStreamDescription(entry, options = {}) {
+  const streamOptions = normalizeStreamOptions(options)
+  const display = formatStreamDisplay(entry, streamOptions)
+  const lines = [
+    display.title,
+    formatStatusDescription(streamOptions),
+  ]
+  if (streamOptions.showHealth) {
+    lines.push(`Health: ${formatHealthLabel(entry)}`)
+  }
+  lines.push(display.description)
+  return lines.filter(Boolean).join('\n')
 }
 
 function formatProviderName(provider) {
@@ -413,6 +576,8 @@ function formatProviderName(provider) {
 }
 
 module.exports = {
+  parseSource,
+  parseSourceFilter,
   rankTorrents,
   rankTorrentsDetailed,
   countEpisodeMatches,
@@ -425,7 +590,10 @@ module.exports = {
   formatStreamFilename,
   formatBingeGroup,
   formatStremioStreamName,
+  formatStremioStreamTitle,
   formatStremioStreamDescription,
+  streamHealth,
   matchesMovieTitle,
+  matchesEpisode,
   looksLikeVideoRelease,
 }

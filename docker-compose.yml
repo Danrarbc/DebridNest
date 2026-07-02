@@ -42,12 +42,16 @@ services:
     profiles: ["tls"]
     image: caddy:2-alpine
     depends_on:
-      - debridnest
+      debridnest:
+        condition: service_started
+      stremio-addon:
+        condition: service_started
     ports:
       - "80:80"
       - "443:443"
     environment:
-      DOMAIN: ${DEBRIDNEST_DOMAIN:-localhost}
+      DEBRIDNEST_DOMAIN: ${DEBRIDNEST_DOMAIN:-localhost}
+      STREMIO_ADDON_DOMAIN: ${STREMIO_ADDON_DOMAIN:-stremio.localhost}
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
@@ -136,6 +140,8 @@ services:
       JACKETT_API_KEY: ${JACKETT_API_KEY:-}
       JACKETT_CONFIG_FILE: /jackett-config/Jackett/ServerConfig.json
       PORT: "7001"
+      ADDON_BASE_URL: ${STREMIO_ADDON_BASE_URL:-http://127.0.0.1:7001}
+      STREMIO_MANIFEST_LABEL: ${STREMIO_MANIFEST_LABEL:-}
       MAX_RESULTS: "20"
       PREFER_SDR: ${PREFER_SDR:-0}
       MAX_RESOLUTION: ${MAX_RESOLUTION:-0}
@@ -146,6 +152,8 @@ services:
       JACKETT_CACHE_TTL_MS: ${JACKETT_CACHE_TTL_MS:-600000}
       PLACEHOLDER_COUNT: ${PLACEHOLDER_COUNT:-10}
       LIST_RESOLVE_COUNT: ${LIST_RESOLVE_COUNT:-0}
+      CACHED_RESOLVE_WAIT_MS: ${CACHED_RESOLVE_WAIT_MS:-8000}
+      LIST_RESOLVE_WAIT_MS: ${LIST_RESOLVE_WAIT_MS:-8000}
       PROGRESS_MAX_WAIT_MS: "120000"
     volumes:
       - jackett-config:/jackett-config:ro

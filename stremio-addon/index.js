@@ -12,8 +12,12 @@ const progressHandler = require('./lib/progressHandler')
 const jackettConfig = require('./lib/jackettConfig')
 const jackett = require('./lib/jackett')
 const quality = require('./lib/quality')
+const presets = require('./lib/presets')
+const configPath = require('./lib/configPath')
 const externalPlayer = require('./lib/externalPlayer')
 const playHandler = require('./lib/playHandler')
+const streamHints = require('./lib/streamHints')
+const { debugLog } = require('./lib/debugLog')
 
 const PORT = Number(process.env.PORT || 7000)
 const ADDON_BASE_URL = process.env.ADDON_BASE_URL || `http://127.0.0.1:${PORT}`
@@ -26,11 +30,17 @@ const DEFAULT_MAX_RESULTS = Number(process.env.MAX_RESULTS || 5)
 const DEFAULT_PREFER_SDR = process.env.PREFER_SDR === '1'
 const DEFAULT_MAX_RESOLUTION = process.env.MAX_RESOLUTION || '0'
 const DEFAULT_MAX_FILE_SIZE_GB = process.env.MAX_FILE_SIZE_GB || '0'
+const DEFAULT_QUALITY_FILTER = process.env.QUALITY_FILTER || ''
+const DEFAULT_SOURCE_FILTER = process.env.SOURCE_FILTER || ''
+const DEFAULT_SHOW_STREAM_HEALTH = process.env.SHOW_STREAM_HEALTH === '1'
+const DEFAULT_MANIFEST_LABEL = process.env.STREMIO_MANIFEST_LABEL || process.env.MANIFEST_LABEL || ''
 const DEFAULT_DEDUPE_STREAMS = process.env.DEDUPE_STREAMS !== '0'
 const DEFAULT_PREFER_SEASON_PACKS = process.env.PREFER_SEASON_PACKS === '1'
+const DEFAULT_FORCE_NOT_WEB_READY = process.env.STREMIO_FORCE_NOT_WEB_READY === '1'
 const PLACEHOLDER_COUNT = Number(process.env.PLACEHOLDER_COUNT || 10)
 const LIST_RESOLVE_COUNT = Number(process.env.LIST_RESOLVE_COUNT || 0)
 const CACHED_RESOLVE_WAIT_MS = Number(process.env.CACHED_RESOLVE_WAIT_MS || 8000)
+const LIST_RESOLVE_WAIT_MS = Number(process.env.LIST_RESOLVE_WAIT_MS || CACHED_RESOLVE_WAIT_MS)
 const DEFAULT_PREWARM_COUNT = process.env.PRELOAD_TOP_RESULT === '1' ? 1 : 0
 const PREWARM_COUNT = Math.max(
   0,
@@ -180,12 +190,16 @@ function resolveApiUrl(userValue) {
 
 function getConfig(userConfig = {}) {
   userConfig = normalizeUserConfig(userConfig)
+  const presetDefaults = presets.configuredDefaults(userConfig)
   const qualityConfig = quality.resolveQualityConfig(userConfig, {
-    preferSdr: DEFAULT_PREFER_SDR,
-    maxResolution: DEFAULT_MAX_RESOLUTION,
-    maxFileSizeGb: DEFAULT_MAX_FILE_SIZE_GB,
+    preferSdr: configValue(presetDefaults.preferSdr, DEFAULT_PREFER_SDR),
+    maxResolution: configValue(presetDefaults.maxResolution, DEFAULT_MAX_RESOLUTION),
+    maxFileSizeGb: configValue(presetDefaults.maxFileSizeGb, DEFAULT_MAX_FILE_SIZE_GB),
+    qualityFilter: configValue(presetDefaults.qualityFilter, DEFAULT_QUALITY_FILTER),
+    sourceFilter: configValue(presetDefaults.sourceFilter, DEFAULT_SOURCE_FILTER),
   })
   return {
+    preset: presets.resolvePreset(userConfig.preset || userConfig.manifestPreset).id,
     apiUrl: resolveApiUrl(userConfig.apiUrl),
     apiToken: resolveApiToken(userConfig.apiToken),
     jackettUrl: configValue(userConfig.jackettUrl, DEFAULT_JACKETT_URL),
@@ -194,8 +208,15 @@ function getConfig(userConfig = {}) {
     preferSdr: qualityConfig.preferSdr,
     maxResolution: String(qualityConfig.maxResolution || '0'),
     maxFileSizeGb: String(qualityConfig.maxFileSizeGb || '0'),
+    qualityFilter: qualityConfig.qualityFilter,
+    sourceFilter: qualityConfig.sourceFilter,
+    showStreamHealth: quality.parsePreferSdr(configValue(
+      userConfig.showStreamHealth ?? userConfig.showHealth ?? userConfig.healthIndicators,
+      DEFAULT_SHOW_STREAM_HEALTH,
+    )),
     dedupeStreams: DEFAULT_DEDUPE_STREAMS,
     preferSeasonPacks: DEFAULT_PREFER_SEASON_PACKS,
+    forceNotWebReady: parseTruthy(userConfig.forceNotWebReady, DEFAULT_FORCE_NOT_WEB_READY),
   }
 }
 
@@ -211,51 +232,87 @@ function maxResolutionDefaultOption() {
   return String(parsed)
 }
 
-function needsNotWebReady(url) {
-  if (!url || typeof url !== 'string') {
-    return true
+function parseTruthy(value, fallback = false) {
+  if (value == null || value === '') {
+    return fallback
   }
-  try {
-    const parsed = new URL(url)
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      return false
-    }
-    if (parsed.protocol === 'http:') {
-      return true
-    }
-    return !/\.mp4(\?|$)/i.test(parsed.pathname)
-  } catch {
-    return true
+  const normalized = String(value).trim().toLowerCase()
+  return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on'
+}
+
+function summarizeStreamForDebug(stream) {
+  const hints = stream?.behaviorHints || {}
+  const url = String(stream?.url || '')
+  return {
+    name: stream?.name || '',
+    hasUrl: !!url,
+    urlScheme: url.split(':')[0] || '',
+    isPlayProxy: externalPlayer.isPlayProxyUrl(url),
+    notWebReady: hints.notWebReady === true,
+    hasFilename: !!hints.filename,
+    hasBingeGroup: !!hints.bingeGroup,
   }
 }
 
+function validateStreamsForStremio(streams) {
+  const issues = []
+  for (const [index, stream] of streams.entries()) {
+    if (!stream?.name) {
+      issues.push({ index, issue: 'missing-name' })
+    }
+    if (!stream?.url) {
+      issues.push({ index, issue: 'missing-url' })
+    }
+    if (stream?.url && !/^https?:\/\//i.test(stream.url)) {
+      issues.push({ index, issue: 'non-http-url' })
+    }
+  }
+  return issues
+}
+
+const STREAM_CACHE = {
+  cacheMaxAge: 3600,
+  staleRevalidate: 14400,
+  staleError: 604800,
+}
+
+function wrapStreamResponse(streams) {
+  return { streams, ...STREAM_CACHE }
+}
+
 function buildStreamObject(entry, options = {}) {
-  const { directUrl = null, progressToken = null, cached = false } = options
+  const {
+    directUrl = null,
+    progressToken = null,
+    cached = false,
+    showHealth = false,
+    debridStatus = '',
+    filename = '',
+    forceNotWebReady = false,
+  } = options
   const label = entry?.torrent?.title || 'DebridNest stream'
-  let streamUrl = directUrl
+  const streamOptions = { cached, showHealth, debridStatus }
+  const streamFilename = rank.formatStreamFilename(filename || label)
 
-  if (!streamUrl) {
-    const streamId = externalPlayer.registerStream({
-      directUrl,
-      progressToken,
-      label,
-    })
-    streamUrl = externalPlayer.buildPlayUrl(streamId, ADDON_BASE_URL)
-  }
+  const streamId = externalPlayer.registerStream({
+    directUrl,
+    progressToken,
+    label,
+  })
+  const playUrl = externalPlayer.buildPlayUrl(streamId, ADDON_BASE_URL, streamFilename)
+  const streamUrl = directUrl || playUrl
 
-  const description = rank.formatStremioStreamDescription(entry, cached)
   const stream = {
-    name: rank.formatStremioStreamName(entry, cached),
-    description,
+    name: rank.formatStremioStreamName(entry, streamOptions),
+    title: rank.formatStremioStreamTitle(entry, streamOptions),
     url: streamUrl,
-    behaviorHints: {
-      bingeGroup: rank.formatBingeGroup(entry),
-      filename: rank.formatStreamFilename(entry.torrent.title),
-    },
-  }
-
-  if (needsNotWebReady(streamUrl)) {
-    stream.behaviorHints.notWebReady = true
+    behaviorHints: streamHints.buildStreamBehaviorHints(
+      entry,
+      streamOptions,
+      streamUrl,
+      streamFilename,
+      { forceNotWebReady },
+    ),
   }
 
   return stream
@@ -365,9 +422,10 @@ function formatStreamRequestLabel(meta) {
 
 const manifest = {
   id: 'com.debridnest.streams',
-  version: '3.1.13',
-  name: 'DebridNest Streams',
+  version: '3.1.26',
+  name: 'DebridNest',
   description: 'Stream movies and series via Jackett/Prowlarr and your self-hosted DebridNest debrid server.',
+  logo: 'https://dl.strem.io/addon-logo.png',
   resources: [
     {
       name: 'stream',
@@ -408,6 +466,14 @@ const manifest = {
       required: true,
     },
     {
+      key: 'preset',
+      type: 'select',
+      title: 'Manifest preset',
+      default: 'Default',
+      options: presets.presetOptions(),
+      presets: presets.presetDefaultsByLabel(),
+    },
+    {
       key: 'maxResults',
       type: 'text',
       title: 'Max streams to resolve',
@@ -431,6 +497,24 @@ const manifest = {
       type: 'text',
       title: 'Max file size (GB, 0 = no limit)',
       default: String(DEFAULT_MAX_FILE_SIZE_GB),
+    },
+    {
+      key: 'qualityFilter',
+      type: 'text',
+      title: 'Quality allowlist (CSV: 4K,1080p,720p,480p,SD; blank = any)',
+      default: DEFAULT_QUALITY_FILTER,
+    },
+    {
+      key: 'sourceFilter',
+      type: 'text',
+      title: 'Source allowlist (CSV: Remux,BluRay,WEB-DL,WEBRip,HDTV; blank = any)',
+      default: DEFAULT_SOURCE_FILTER,
+    },
+    {
+      key: 'showStreamHealth',
+      type: 'checkbox',
+      title: 'Show stream health/status indicators',
+      default: DEFAULT_SHOW_STREAM_HEALTH ? 'true' : 'false',
     },
   ],
 }
@@ -471,42 +555,84 @@ if (ENABLE_MAGNET_TEST) {
 
 builder.defineStreamHandler(async (args) => {
   const config = getConfig(args.config)
+  // #region agent log
+  debugLog({
+    hypothesisId: 'H1',
+    location: 'index.js:streamHandler:entry',
+    message: 'stream handler invoked',
+    data: {
+      type: args.type,
+      id: args.id,
+      hasApiToken: !!config.apiToken,
+      hasJackett: !!(config.jackettUrl && config.jackettApiKey),
+      maxResults: config.maxResults,
+    },
+  })
+  // #endregion
   requireConfig(config)
 
   if (ENABLE_MAGNET_TEST && args.type === 'movie' && args.id.startsWith('magnet:')) {
     const magnet = decodeMagnetId(args.id)
     if (!magnet) {
-      return { streams: [] }
+      return wrapStreamResponse([])
     }
     const resolved = await debridnest.resolveMagnet(config.apiUrl, config.apiToken, magnet, {
       pollIntervalMs: PROGRESS_POLL_MS,
     })
-    return {
-      streams: [buildStreamObject(
+    return wrapStreamResponse([
+      buildStreamObject(
         { torrent: { title: resolved.filename || 'DebridNest' } },
-        { directUrl: resolved.download },
-      )],
-    }
+        {
+          directUrl: resolved.download,
+          filename: resolved.filename,
+          showHealth: config.showStreamHealth,
+          forceNotWebReady: config.forceNotWebReady,
+        },
+      ),
+    ])
   }
 
   if (!['movie', 'series'].includes(args.type)) {
-    return { streams: [] }
+    return wrapStreamResponse([])
   }
 
   const meta = await cinemeta.resolveMetadata(args.type, args.id)
   if (!meta) {
     console.warn(`[streams] Could not resolve metadata for ${args.type} id=${args.id}`)
-    return { streams: [] }
+    // #region agent log
+    debugLog({
+      hypothesisId: 'H3',
+      location: 'index.js:streamHandler:no-meta',
+      message: 'metadata resolution failed',
+      data: { type: args.type, id: args.id },
+    })
+    // #endregion
+    return wrapStreamResponse([])
   }
 
   if (args.type === 'series' && (meta.season == null || meta.episode == null)) {
     console.warn(`[streams] Series request missing season/episode in id=${args.id}`)
-    return { streams: [] }
+    return wrapStreamResponse([])
   }
 
   const qualityConfig = getQualityConfig(config)
   const searchResult = await scrapers.searchAllDetailed(config, meta)
   const torrents = searchResult.torrents
+  // #region agent log
+  debugLog({
+    hypothesisId: 'H3',
+    location: 'index.js:streamHandler:search',
+    message: 'jackett search completed',
+    data: {
+      id: args.id,
+      title: meta.title || meta.imdbId,
+      season: meta.season,
+      episode: meta.episode,
+      torrentCount: torrents.length,
+      cacheHit: !!searchResult.cacheHit,
+    },
+  })
+  // #endregion
   if (!torrents.length) {
     console.warn(
       `[streams] No Jackett results for ${meta.title || meta.imdbId}`
@@ -522,7 +648,7 @@ builder.defineStreamHandler(async (args) => {
         + ` (${JSON.stringify(ranking.rejected)})`,
       )
     }
-    return { streams: [] }
+    return wrapStreamResponse([])
   }
 
   const hashes = ranked.map((e) => e.torrent.infoHash).filter(Boolean)
@@ -541,6 +667,7 @@ builder.defineStreamHandler(async (args) => {
   const streams = []
   const placeholderCandidates = []
   let resolvedCount = 0
+  let resolveAttempts = 0
   const seenHashes = new Set()
 
   for (const entry of ordered) {
@@ -555,20 +682,28 @@ builder.defineStreamHandler(async (args) => {
     const cached = rank.isEntryCached(entry, availability)
     let resolved = null
 
-    if (cached && resolvedCount < LIST_RESOLVE_COUNT && hasDownloadSource(entry)) {
+    if (resolveAttempts < LIST_RESOLVE_COUNT && hasDownloadSource(entry)) {
+      resolveAttempts++
       const candidateOpts = {
-        maxWaitMs: CACHED_RESOLVE_WAIT_MS,
+        maxWaitMs: cached ? CACHED_RESOLVE_WAIT_MS : LIST_RESOLVE_WAIT_MS,
         torrentLink: entry.torrent.link,
         season: meta.season,
         episode: meta.episode,
       }
       try {
-        resolved = await debridnest.resolveCachedOnly(
-          config.apiUrl,
-          config.apiToken,
-          entry.torrent.magnet,
-          candidateOpts,
-        )
+        resolved = cached
+          ? await debridnest.resolveCachedOnly(
+            config.apiUrl,
+            config.apiToken,
+            entry.torrent.magnet,
+            candidateOpts,
+          )
+          : await debridnest.resolveStreamableQuick(
+            config.apiUrl,
+            config.apiToken,
+            entry.torrent.magnet,
+            candidateOpts,
+          )
       } catch {
         resolved = null
       }
@@ -577,7 +712,11 @@ builder.defineStreamHandler(async (args) => {
     if (resolved?.download) {
       streams.push(buildStreamObject(entry, {
         directUrl: resolved.download,
+        filename: resolved.filename,
         cached: cached || resolved.info?.status === 'downloaded',
+        showHealth: config.showStreamHealth,
+        debridStatus: resolved.info?.status || '',
+        forceNotWebReady: config.forceNotWebReady,
       }))
       resolvedCount++
       continue
@@ -613,6 +752,8 @@ builder.defineStreamHandler(async (args) => {
       streams.push(buildStreamObject(entry, {
         progressToken,
         cached,
+        showHealth: config.showStreamHealth,
+        forceNotWebReady: config.forceNotWebReady,
       }))
       if (prewarmed < maxPrewarm && prewarmProgressJob(progressToken, entry)) {
         prewarmed++
@@ -625,10 +766,27 @@ builder.defineStreamHandler(async (args) => {
 
   console.log(
     `[streams] ${args.type}/${args.id} → ${streams.length} streams`
-    + ` (${resolvedCount} direct, ${placeholders} placeholder, ${prewarmed} prewarm)`,
+    + ` (${resolvedCount} direct, ${placeholders} placeholder, ${prewarmed} prewarm, ${resolveAttempts} resolve attempts)`,
   )
 
-  return { streams }
+  const validationIssues = validateStreamsForStremio(streams)
+  // #region agent log
+  debugLog({
+    hypothesisId: 'H4',
+    location: 'index.js:streamHandler:result',
+    message: 'stream handler result',
+    data: {
+      id: args.id,
+      streamCount: streams.length,
+      resolvedCount,
+      placeholderCount: placeholders,
+      validationIssues,
+      sample: streams.slice(0, 2).map(summarizeStreamForDebug),
+    },
+  })
+  // #endregion
+
+  return wrapStreamResponse(streams)
 })
 
 async function resolveFromQuery(req) {
@@ -852,10 +1010,82 @@ async function handleStreamDiagnostics(req, res) {
   }
 }
 
+function parseConfigParam(value) {
+  const raw = String(value || '')
+  if (!raw) {
+    return null
+  }
+  const candidates = [raw]
+  try {
+    candidates.push(decodeURIComponent(raw))
+  } catch {
+    // Express usually decodes params; malformed escapes can fall through to the SDK router.
+  }
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed
+      }
+    } catch {
+      // try the next representation
+    }
+  }
+  return null
+}
+
+function handleConfiguredManifest(req, res, next) {
+  let userConfig = parseConfigParam(req.params.config)
+  if (!userConfig) {
+    console.warn(`[manifest] Could not parse config from ${safeRequestPath(req)}`)
+    next()
+    return
+  }
+  if (DEFAULT_MANIFEST_LABEL && !userConfig.manifestLabel && !userConfig.addonLabel) {
+    userConfig = { ...userConfig, manifestLabel: DEFAULT_MANIFEST_LABEL }
+  }
+  const configuredManifest = presets.buildConfiguredManifest(addonInterface.manifest, userConfig)
+  // #region agent log
+  debugLog({
+    hypothesisId: 'H5',
+    location: 'index.js:handleConfiguredManifest',
+    message: 'manifest served',
+    data: {
+      manifestId: configuredManifest.id,
+      version: configuredManifest.version,
+      installRev: userConfig.installRev || null,
+      configKeys: Object.keys(userConfig).filter((key) => !/token|key|password/i.test(key)),
+    },
+  })
+  // #endregion
+  res.setHeader('Content-Type', 'application/json; charset=utf-8')
+  res.end(JSON.stringify(configuredManifest))
+}
+
 const addonInterface = builder.getInterface()
 const app = express()
 const hasConfig = !!(addonInterface.manifest.config || []).length
 const landingHTML = landingTemplate(addonInterface.manifest)
+
+app.use((req, res, next) => {
+  configPath.repairConfiguredAddonRequest(req)
+  next()
+})
+
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*')
+  res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, X-Admin-Token')
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+  res.setHeader('Access-Control-Allow-Private-Network', 'true')
+  if (req.path.endsWith('/manifest.json') || req.path.includes('/stream/')) {
+    res.setHeader('Cache-Control', 'no-store, no-cache, max-age=0')
+  }
+  if (req.method === 'OPTIONS') {
+    res.status(204).end()
+    return
+  }
+  next()
+})
 
 // /resolve — localhost or X-Admin-Token only; DebridNest URL from env; token via Authorization Bearer.
 app.get('/resolve', requireLocalOrAdmin, async (req, res) => {
@@ -921,7 +1151,7 @@ app.get('/open/:streamId', async (req, res) => {
   }))
 })
 
-app.get('/play/:streamId', async (req, res) => {
+async function handlePlayRequest(req, res) {
   const entry = externalPlayer.getStream(req.params.streamId)
   if (!entry) {
     res.status(404).send('Stream link expired or not found')
@@ -935,7 +1165,10 @@ app.get('/play/:streamId', async (req, res) => {
     console.error(`[play] ${req.params.streamId}: ${err.message}`)
     sendPlayError(res, entry, err)
   }
-})
+}
+
+app.get('/play/:streamId', handlePlayRequest)
+app.get('/play/:streamId/:filename', handlePlayRequest)
 
 app.get('/progress/:token', async (req, res) => {
   const job = progress.getJob(req.params.token)
@@ -1009,12 +1242,32 @@ app.get('/health', requireLocalOrAdmin, async (req, res) => {
 })
 
 app.use((req, res, next) => {
-  if (req.path.includes('/stream/')) {
-    console.log(`[http] ${req.method} ${safeRequestPath(req)}`)
+  if (req.path.includes('/stream/') || req.path.endsWith('/manifest.json')) {
+    const ip = normalizeRemoteIp(req.ip || req.socket?.remoteAddress || '')
+    const pathLabel = req.path.includes('/stream/') ? safeRequestPath(req) : safeRequestPath(req)
+    console.log(`[http] ${req.method} ${pathLabel} from ${ip || 'unknown'}`)
+    // #region agent log
+    res.on('finish', () => {
+      debugLog({
+        hypothesisId: req.path.includes('/stream/') ? 'H1' : 'H5',
+        location: 'index.js:httpMiddleware',
+        message: 'addon HTTP response',
+        data: {
+          method: req.method,
+          path: pathLabel,
+          clientIp: ip || 'unknown',
+          statusCode: res.statusCode,
+          origin: req.get('origin') || '',
+          userAgent: (req.get('user-agent') || '').slice(0, 80),
+        },
+      })
+    })
+    // #endregion
   }
   next()
 })
 
+app.get('/:config/manifest.json', handleConfiguredManifest)
 app.use(getRouter(addonInterface))
 
 app.get('/', (_, res) => {

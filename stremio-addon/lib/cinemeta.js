@@ -1,6 +1,13 @@
-const CINEMETA_BASE = 'https://v3-cinemeta.strem.io'
+const CINEMETA_BASES = [
+  process.env.CINEMETA_BASE || 'https://cinemeta-live.strem.io',
+  'https://v3-cinemeta.strem.io',
+]
 const CINEMETA_CACHE_TTL_MS = Number(process.env.CINEMETA_CACHE_TTL_MS || 6 * 60 * 60 * 1000)
 const metaCache = new Map()
+
+function hasUsableMeta(meta) {
+  return !!(meta && (meta.name || meta.imdb_id))
+}
 
 function parseStremioId(id) {
   if (!id || !id.startsWith('tt')) {
@@ -32,18 +39,31 @@ async function fetchMeta(type, imdbId) {
   const path = type === 'series'
     ? `/meta/series/${imdbId}.json`
     : `/meta/movie/${imdbId}.json`
-  const promise = fetch(`${CINEMETA_BASE}${path}`)
-    .then(async (res) => {
-      if (!res.ok) {
-        throw new Error(`Cinemeta ${res.status}`)
+  const promise = (async () => {
+    let lastError = null
+    for (const base of CINEMETA_BASES) {
+      try {
+        const res = await fetch(`${base}${path}`, { redirect: 'follow' })
+        if (!res.ok) {
+          lastError = new Error(`Cinemeta ${res.status}`)
+          continue
+        }
+        const data = await res.json()
+        if (hasUsableMeta(data?.meta)) {
+          return data.meta
+        }
+      } catch (err) {
+        lastError = err
       }
-      const data = await res.json()
-      return data.meta
-    })
-    .catch((err) => {
-      metaCache.delete(cacheKey)
-      throw err
-    })
+    }
+    if (lastError) {
+      throw lastError
+    }
+    return null
+  })().catch((err) => {
+    metaCache.delete(cacheKey)
+    throw err
+  })
 
   if (CINEMETA_CACHE_TTL_MS > 0) {
     metaCache.set(cacheKey, {
@@ -60,9 +80,23 @@ async function resolveMetadata(type, id) {
     return null
   }
 
-  const meta = await fetchMeta(type, parsed.imdbId)
-  if (!meta) {
-    return null
+  let meta = null
+  try {
+    meta = await fetchMeta(type, parsed.imdbId)
+  } catch (err) {
+    console.warn(`[cinemeta] lookup failed for ${type} ${parsed.imdbId}: ${err.message}`)
+  }
+
+  if (!hasUsableMeta(meta)) {
+    console.warn(`[cinemeta] No metadata for ${type} ${parsed.imdbId}; continuing with IMDB id only`)
+    return {
+      imdbId: parsed.imdbId,
+      type,
+      title: null,
+      year: null,
+      season: parsed.season,
+      episode: parsed.episode,
+    }
   }
 
   return {
