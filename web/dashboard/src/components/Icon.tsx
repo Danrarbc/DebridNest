@@ -5,6 +5,11 @@ const PATHS: Record<string, string[]> = {
   gauge: ['M15.6 2.7a10 10 0 1 0 5.7 5.7', 'M12 12l7-3'],
   'arrow-down-to-line': ['M12 17V3', 'M6 11l6 6 6-6', 'M19 21H5'],
   library: ['M16 6l4 14', 'M12 6v14', 'M8 8v12', 'M4 4v16'],
+  tv: [
+    'M7 21h10',
+    'M12 17v4',
+    'M4 3h16a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z',
+  ],
   'settings-2': ['M20 7h-9', 'M14 17H5'],
   users: [
     'M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2',

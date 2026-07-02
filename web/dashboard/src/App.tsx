@@ -8,15 +8,25 @@ import Library from './pages/Library';
 import Logs from './pages/Logs';
 import Overview from './pages/Overview';
 import Settings from './pages/Settings';
+import StremioSetup from './pages/StremioSetup';
 import Torrents from './pages/Torrents';
 import Users from './pages/Users';
 
-export type Tab = 'overview' | 'torrents' | 'library' | 'settings' | 'users' | 'activity' | 'logs';
+export type Tab =
+  | 'overview'
+  | 'torrents'
+  | 'library'
+  | 'stremio'
+  | 'settings'
+  | 'users'
+  | 'activity'
+  | 'logs';
 
 const TITLES: Record<Tab, string> = {
   overview: 'Overview',
   torrents: 'Torrents',
   library: 'Library',
+  stremio: 'Stremio',
   settings: 'Settings',
   users: 'Users',
   activity: 'Activity',
@@ -27,6 +37,7 @@ const NAV_ITEMS: { key: Tab; label: string; icon: string }[] = [
   { key: 'overview', label: 'Overview', icon: 'gauge' },
   { key: 'torrents', label: 'Torrents', icon: 'arrow-down-to-line' },
   { key: 'library', label: 'Library', icon: 'library' },
+  { key: 'stremio', label: 'Stremio', icon: 'tv' },
   { key: 'settings', label: 'Settings', icon: 'settings-2' },
 ];
 
@@ -42,6 +53,7 @@ const ROUTES: Record<Tab, string> = {
   overview: '/dashboard/',
   torrents: '/dashboard/torrents',
   library: '/dashboard/library',
+  stremio: '/dashboard/stremio',
   settings: '/dashboard/settings',
   users: '/dashboard/users',
   activity: '/dashboard/activity',
@@ -293,6 +305,7 @@ export default function App() {
             {tab === 'overview' && <Overview onNavigate={selectTab} />}
             {tab === 'torrents' && <Torrents />}
             {tab === 'library' && <Library />}
+            {tab === 'stremio' && <StremioSetup />}
             {tab === 'settings' && <Settings isAdmin={isAdmin} />}
             {tab === 'users' && isAdmin && <Users />}
             {tab === 'activity' && isAdmin && <Activity />}

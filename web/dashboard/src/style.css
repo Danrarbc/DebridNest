@@ -1746,6 +1746,86 @@ th.num-cell {
   min-width: 760px;
 }
 
+/* ============ Stremio setup ============ */
+
+.stremio-setup {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  max-width: 980px;
+}
+
+.stremio-hero-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.stremio-install-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.stremio-check-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.stremio-check-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+  padding: 0.7rem 0.8rem;
+  border: 1px solid var(--border-1);
+  border-radius: var(--radius-sm);
+  background: var(--bg-1);
+}
+
+.stremio-check-row .pill {
+  margin-top: 1px;
+}
+
+.stremio-check-text {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  min-width: 0;
+}
+
+.stremio-check-text strong {
+  color: var(--text-1);
+  font-size: var(--text-base);
+  font-weight: var(--weight-semibold);
+}
+
+.stremio-check-text span {
+  color: var(--text-2);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+}
+
+.stremio-warning-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 14px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.stremio-warning-list li {
+  padding: 0.55rem 0.7rem;
+  border: 1px solid rgba(232, 180, 90, 0.22);
+  border-radius: var(--radius-sm);
+  background: var(--warning-soft);
+  color: var(--warning);
+  font-size: var(--text-xs);
+}
+
 /* ============ Activity ============ */
 
 .activity-feed {
@@ -2185,6 +2265,10 @@ th.num-cell {
     grid-template-columns: 1fr;
   }
 
+  .stremio-check-list {
+    grid-template-columns: 1fr;
+  }
+
   .lifecycle-summary,
   .detail-summary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -2239,6 +2323,10 @@ th.num-cell {
   .storage-policy-grid,
   .storage-prefix-row {
     grid-template-columns: 1fr;
+  }
+
+  .stremio-install-actions > .btn {
+    width: 100%;
   }
 
   .add-torrent-row {

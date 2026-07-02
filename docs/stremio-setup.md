@@ -99,6 +99,12 @@ curl -s 'http://127.0.0.1:7001/diagnostics?jackettUrl=http%3A%2F%2Fhost.docker.i
 
 ## 3. Install the Stremio addon
 
+Dashboard setup page: `http://localhost:8080/dashboard/stremio`
+
+The dashboard setup page generates a configured manifest URL from your current DebridNest token,
+quality filters, and prewarm rules. Use **Test manifest** and **Run checks** before installing; the
+checks validate the exact manifest URL against the addon, DebridNest API, and Jackett/Prowlarr.
+
 Configure page: `http://127.0.0.1:7001/configure`
 
 ### Stremio Desktop (recommended)
@@ -159,6 +165,21 @@ Cached streams show a ⚡ label; uncached show ⏳ while DebridNest downloads. S
 First play may take minutes while DebridNest downloads the torrent.
 
 Stream listing is non-blocking by default: opening Stremio's Streams tab searches Jackett and returns placeholder streams without adding magnets to DebridNest. The selected stream starts the DebridNest download. Set `LIST_RESOLVE_COUNT` above `0` only if you intentionally want the addon to pre-resolve already-cached DebridNest items into direct URLs while listing.
+
+### Smart prewarm
+
+Prewarm can start selected downloads while the stream list is being built so Stremio has less waiting
+after you click a result. Configure this per install from the dashboard setup page, or set defaults in
+`.env`:
+
+| Variable / field | Default | Description |
+|------------------|---------|-------------|
+| `PREWARM_COUNT` / Top streams | `0` | Number of listed placeholder streams to start in the background |
+| `PREWARM_MODE` / Strategy | `off` | `off`, `cached`, or `all` |
+| `PREWARM_INDEXERS` / Indexer allowlist | blank | CSV list of indexer names to prewarm; blank allows any indexer |
+
+Use `cached` for conservative installs. Use `all` only when you are comfortable starting the top
+ranked torrent as soon as you open the Streams tab.
 
 Set `ADDON_BASE_URL` to a URL reachable by Stremio when using downloading placeholders remotely (e.g. `https://addon.example.com`).
 

@@ -17,6 +17,7 @@ const configPath = require('./lib/configPath')
 const externalPlayer = require('./lib/externalPlayer')
 const playHandler = require('./lib/playHandler')
 const streamHints = require('./lib/streamHints')
+const prewarmRules = require('./lib/prewarmRules')
 const { debugLog } = require('./lib/debugLog')
 
 const PORT = Number(process.env.PORT || 7000)
@@ -46,6 +47,8 @@ const PREWARM_COUNT = Math.max(
   0,
   Number(process.env.PREWARM_COUNT ?? DEFAULT_PREWARM_COUNT) || 0,
 )
+const DEFAULT_PREWARM_MODE = process.env.PREWARM_MODE || (PREWARM_COUNT > 0 ? 'all' : 'off')
+const DEFAULT_PREWARM_INDEXERS = process.env.PREWARM_INDEXERS || ''
 const PROGRESS_POLL_MS = Number(process.env.PROGRESS_POLL_MS || 500)
 const JACKETT_TORRENT_PREFETCH_COUNT = Math.max(
   0,
@@ -198,6 +201,11 @@ function getConfig(userConfig = {}) {
     qualityFilter: configValue(presetDefaults.qualityFilter, DEFAULT_QUALITY_FILTER),
     sourceFilter: configValue(presetDefaults.sourceFilter, DEFAULT_SOURCE_FILTER),
   })
+  const prewarmConfig = prewarmRules.resolveConfig(userConfig, {
+    count: PREWARM_COUNT,
+    mode: DEFAULT_PREWARM_MODE,
+    indexers: DEFAULT_PREWARM_INDEXERS,
+  })
   return {
     preset: presets.resolvePreset(userConfig.preset || userConfig.manifestPreset).id,
     apiUrl: resolveApiUrl(userConfig.apiUrl),
@@ -217,6 +225,7 @@ function getConfig(userConfig = {}) {
     dedupeStreams: DEFAULT_DEDUPE_STREAMS,
     preferSeasonPacks: DEFAULT_PREFER_SEASON_PACKS,
     forceNotWebReady: parseTruthy(userConfig.forceNotWebReady, DEFAULT_FORCE_NOT_WEB_READY),
+    ...prewarmConfig,
   }
 }
 
@@ -516,6 +525,25 @@ const manifest = {
       title: 'Show stream health/status indicators',
       default: DEFAULT_SHOW_STREAM_HEALTH ? 'true' : 'false',
     },
+    {
+      key: 'prewarmCount',
+      type: 'text',
+      title: 'Prewarm top streams (0-10)',
+      default: String(PREWARM_COUNT),
+    },
+    {
+      key: 'prewarmMode',
+      type: 'select',
+      title: 'Prewarm strategy',
+      default: DEFAULT_PREWARM_MODE,
+      options: ['off', 'cached', 'all'],
+    },
+    {
+      key: 'prewarmIndexers',
+      type: 'text',
+      title: 'Prewarm only these indexers (CSV, blank = any)',
+      default: DEFAULT_PREWARM_INDEXERS,
+    },
   ],
 }
 
@@ -727,7 +755,7 @@ builder.defineStreamHandler(async (args) => {
 
   const maxStreams = config.maxResults
   const maxPlaceholders = Math.min(maxStreams, PLACEHOLDER_COUNT)
-  const maxPrewarm = Math.min(maxPlaceholders, PREWARM_COUNT)
+  const maxPrewarm = Math.min(maxPlaceholders, config.prewarmCount)
 
   let placeholders = 0
   let prewarmed = 0
@@ -755,7 +783,11 @@ builder.defineStreamHandler(async (args) => {
         showHealth: config.showStreamHealth,
         forceNotWebReady: config.forceNotWebReady,
       }))
-      if (prewarmed < maxPrewarm && prewarmProgressJob(progressToken, entry)) {
+      if (
+        prewarmed < maxPrewarm
+        && prewarmRules.shouldPrewarm(entry, cached, config)
+        && prewarmProgressJob(progressToken, entry)
+      ) {
         prewarmed++
       }
       placeholders++
@@ -1062,6 +1094,68 @@ function handleConfiguredManifest(req, res, next) {
   res.end(JSON.stringify(configuredManifest))
 }
 
+async function handleConfiguredDiagnostics(req, res) {
+  const userConfig = parseConfigParam(req.params.config)
+  if (!userConfig) {
+    res.status(400).json({ ok: false, error: 'Could not parse configured addon URL.' })
+    return
+  }
+
+  const config = getConfig(userConfig)
+  const configuredManifest = presets.buildConfiguredManifest(addonInterface.manifest, userConfig)
+  const result = {
+    ok: true,
+    manifest: {
+      ok: true,
+      id: configuredManifest.id,
+      name: configuredManifest.name,
+      version: configuredManifest.version,
+      resources: configuredManifest.resources,
+    },
+    debridnest: { ok: false },
+    jackett: { ok: false },
+    prewarm: {
+      count: config.prewarmCount,
+      mode: config.prewarmMode,
+      indexers: config.prewarmIndexers,
+    },
+    hints: [],
+  }
+
+  try {
+    requireDebridNestConfig(config)
+    const user = await debridnest.getUser(config.apiUrl, config.apiToken)
+    result.debridnest = { ok: true, username: user.username || user.id || 'authenticated' }
+  } catch (err) {
+    result.ok = false
+    result.debridnest = { ok: false, error: err.message }
+    result.hints.push('DebridNest token or API URL failed. Reinstall with a current API token.')
+  }
+
+  const indexerStats = await jackettConfig.fetchIndexerStats(config.jackettUrl, config.jackettApiKey)
+  if (indexerStats.error) {
+    result.ok = false
+    result.jackett = { ok: false, error: indexerStats.error }
+    result.hints.push('Jackett/Prowlarr is not reachable from the addon or the API key was rejected.')
+  } else {
+    result.jackett = {
+      ok: indexerStats.configured > 0,
+      configuredIndexers: indexerStats.configured,
+      totalIndexers: indexerStats.total,
+    }
+    if (indexerStats.configured === 0) {
+      result.ok = false
+      result.hints.push('Jackett/Prowlarr responded but no indexers are configured.')
+    }
+  }
+
+  if (config.prewarmCount > 0 && config.prewarmMode === 'all') {
+    result.hints.push('Prewarm is allowed to start downloads while browsing streams.')
+  }
+
+  res.json(result)
+}
+
 const addonInterface = builder.getInterface()
 const app = express()
 const hasConfig = !!(addonInterface.manifest.config || []).length
@@ -1268,6 +1362,7 @@ app.use((req, res, next) => {
 })
 
 app.get('/:config/manifest.json', handleConfiguredManifest)
+app.get('/:config/diagnostics', handleConfiguredDiagnostics)
 app.use(getRouter(addonInterface))
 
 app.get('/', (_, res) => {

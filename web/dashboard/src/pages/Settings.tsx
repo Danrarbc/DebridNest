@@ -1069,8 +1069,8 @@ export default function SettingsPage({ isAdmin }: SettingsProps) {
           <UrlRow label="Dashboard" url={urls.dashboard} />
         </div>
         <p className="hint-text">
-          Stremio addon runs separately (default port 7001). Use the configure page to generate a
-          personalized manifest URL.
+          Stremio addon runs separately (default port 7001). Use the Stremio dashboard page to
+          generate, test, and install a personalized manifest URL.
         </p>
       </section>
 

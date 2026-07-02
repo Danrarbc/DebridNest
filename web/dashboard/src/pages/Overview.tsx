@@ -245,6 +245,12 @@ export default function Overview({ onNavigate }: { onNavigate: (tab: Tab) => voi
             description="Limits, notifications, maintenance"
             onClick={() => onNavigate('settings')}
           />
+          <QuickLink
+            icon="tv"
+            label="Stremio"
+            description="Manifest install, checks, prewarm rules"
+            onClick={() => onNavigate('stremio')}
+          />
           {stats.webdavEnabled && base && (
             <QuickLink
               icon="hard-drive"
